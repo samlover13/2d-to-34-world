@@ -18,6 +18,7 @@ import {
 } from './server/db.ts';
 import { generateSample2DCartoonVideo, probeVideo } from './server/ffmpeg.ts';
 import { enqueueJobPipeline, isJobRunning } from './server/geminiPipeline.ts';
+import { VISUAL_STYLES, resolveVisualStyle } from './server/types.ts';
 
 dotenv.config();
 
@@ -107,6 +108,11 @@ async function startServer(): Promise<void> {
       maxDurationSec: 60,
       supportedFormats: ['MP4', 'MOV'],
       geminiConfigured: keyConfigured,
+      visualStyles: VISUAL_STYLES.map(({ id, name, description }) => ({
+        id,
+        name,
+        description,
+      })),
     });
   });
 
@@ -150,6 +156,14 @@ async function startServer(): Promise<void> {
           );
         }
 
+        const requestedStyle =
+          typeof req.body?.visual_style === 'string'
+            ? req.body.visual_style
+            : typeof req.body?.visualStyle === 'string'
+              ? req.body.visualStyle
+              : undefined;
+        const resolvedStyle = resolveVisualStyle(requestedStyle);
+
         const jobId = crypto.randomUUID();
         const jobDir = path.join(JOBS_BASE_DIR, jobId);
         fs.mkdirSync(jobDir, { recursive: true });
@@ -159,6 +173,7 @@ async function startServer(): Promise<void> {
         createJobRecord({
           jobId,
           originalFilename: originalName,
+          visualStyle: resolvedStyle.id,
           inputPath: persistedInputPath,
           metadata,
         });

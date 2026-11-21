@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from database import (
@@ -34,6 +34,7 @@ from gemini_veo_service import (
     analyze_full_cartoon_video,
     generate_3d_anime_character_reference,
     generate_veo_3d_anime_scene,
+    resolve_visual_style,
 )
 
 STAGE_LABELS = {
@@ -62,9 +63,12 @@ app = FastAPI(title="Cartoon AI Studio API", version="1.0.0")
 
 
 def serialize_job(job: ConversionJob) -> Dict:
+    style = resolve_visual_style(getattr(job, "visual_style", None))
     return {
         "jobId": job.job_id,
         "originalFilename": job.original_filename,
+        "visualStyle": style["id"],
+        "visualStyleLabel": style["name"],
         "status": job.status,
         "progress": job.progress,
         "currentStage": job.current_stage,
@@ -127,6 +131,7 @@ def run_resumable_pipeline(job_id: str) -> None:
             return
 
         metadata = json.loads(job.metadata_json)
+        style = resolve_visual_style(getattr(job, "visual_style", None))
         duration_sec = float(metadata["durationSec"])
         job_dir = WORK_DIR / job_id
         frames_dir = job_dir / "frames"
@@ -157,8 +162,8 @@ def run_resumable_pipeline(job_id: str) -> None:
         # Stage 3 & 4: Gemini full-video analysis + character registry
         analysis = json.loads(job.analysis_json) if job.analysis_json else None
         if job.last_completed_stage < 4 or not analysis:
-            _update_job(db, job, current_stage=3, progress=28, stage_detail="Gemini analyzing full video...")
-            analysis = analyze_full_cartoon_video(job.input_path, duration_sec)
+            _update_job(db, job, current_stage=3, progress=28, stage_detail=f"Gemini analyzing full video for {style['name']}...")
+            analysis = analyze_full_cartoon_video(job.input_path, duration_sec, style["id"])
             _update_job(db, job, current_stage=4, progress=38, analysis_json=json.dumps(analysis), last_completed_stage=3)
 
             db.query(CharacterRecord).filter(CharacterRecord.job_id == job_id).delete()
@@ -208,6 +213,7 @@ def run_resumable_pipeline(job_id: str) -> None:
                             "distinctiveFeatures": char.distinctive_features,
                         },
                         ref_path,
+                        style["id"],
                     )
                     if ok:
                         char.anime_ref_asset = ref_name
@@ -242,7 +248,8 @@ def run_resumable_pipeline(job_id: str) -> None:
                     piece = min(10.0, seg_end - cursor)
                     end_pt = min(duration_sec, cursor + piece)
                     prompt = (
-                        "Convert this 2D cartoon scene to theatrical 3D CG Anime preserving exact motion and framing.\n"
+                        f"Convert this 2D cartoon scene to {style['name']} preserving exact motion and framing.\n"
+                        f"TARGET VISUAL STYLE ({style['name']}): {style['video_scene_directive']} {analysis.get('overallStyleNotes', '')}\n"
                         f"CHARACTER CONSISTENCY: {char_summary}\n"
                         f"SCENE ({cursor:.1f}s-{end_pt:.1f}s): {raw.get('summary', '')}. "
                         f"Actions: {raw.get('expressionsAndActions', '')}. "
@@ -364,7 +371,11 @@ def run_resumable_pipeline(job_id: str) -> None:
 
 
 @app.post("/api/jobs", status_code=201)
-async def create_job(video: UploadFile = File(...)):
+async def create_job(
+    video: UploadFile = File(...),
+    visual_style: str = Form("pixar_3d"),
+):
+    resolved_style = resolve_visual_style(visual_style)
     filename = os.path.basename(video.filename or "cartoon.mp4")
     ext = Path(filename).suffix.lower()
     if ext not in ALLOWED_EXTS:
@@ -395,13 +406,14 @@ async def create_job(video: UploadFile = File(...)):
         job = ConversionJob(
             job_id=job_id,
             original_filename=filename,
+            visual_style=resolved_style["id"],
             input_path=str(input_path),
             gcs_input_uri=gcs_input_uri,
             status="queued",
             progress=5,
             current_stage=1,
             last_completed_stage=1,
-            stage_detail="Uploaded and validated. Queued for processing.",
+            stage_detail=f"Uploaded and validated ({resolved_style['name']}). Queued for processing.",
             metadata_json=json.dumps(metadata),
         )
         db.add(job)

@@ -3,6 +3,7 @@ package com.cartoonaistudio.app.data
 import com.cartoonaistudio.app.BuildConfig
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
+import okhttp3.RequestBody
 import okhttp3.ResponseBody
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Response
@@ -20,7 +21,8 @@ interface CartoonApiService {
     @Multipart
     @POST("api/jobs")
     suspend fun createJob(
-        @Part video: MultipartBody.Part
+        @Part video: MultipartBody.Part,
+        @Part("visual_style") visualStyle: RequestBody
     ): Response<CreateJobResponse>
 
     @GET("api/jobs")

@@ -24,6 +24,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.io.FileOutputStream
 
@@ -36,6 +37,7 @@ enum class ScreenRoute {
 data class StudioUiState(
     val route: ScreenRoute = ScreenRoute.HOME,
     val selectedVideo: LocalVideoInfo? = null,
+    val selectedStyleId: String = "pixar_3d",
     val activeJob: JobStatusDto? = null,
     val isUploading: Boolean = false,
     val isDownloading: Boolean = false,
@@ -73,6 +75,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun onStyleSelected(styleId: String) {
+        _uiState.update { it.copy(selectedStyleId = styleId) }
+    }
+
     fun startConversion() {
         val selected = _uiState.value.selectedVideo ?: return
         if (_uiState.value.isUploading) return
@@ -85,9 +91,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 val requestBody = tempFile.asRequestBody(selected.mimeType.toMediaTypeOrNull())
                 val multipart = MultipartBody.Part.createFormData("video", selected.displayName, requestBody)
+                val styleBody = _uiState.value.selectedStyleId.toRequestBody("text/plain".toMediaTypeOrNull())
 
                 val response = withContext(Dispatchers.IO) {
-                    ApiClient.service.createJob(multipart)
+                    ApiClient.service.createJob(multipart, styleBody)
                 }
                 tempFile.delete()
 

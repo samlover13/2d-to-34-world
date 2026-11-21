@@ -11,6 +11,66 @@ export const PIPELINE_STAGES = [
   { id: 10, key: 'rendering_mp4', label: 'Rendering final MP4' },
 ] as const;
 
+export type VisualStyleId =
+  | 'pixar_3d'
+  | 'stylized_3d'
+  | 'cel_shaded_npr'
+  | 'low_poly'
+  | 'chibi_sd'
+  | 'stop_motion_clay';
+
+export interface VisualStyleOption {
+  id: VisualStyleId;
+  name: string;
+  tagline: string;
+  description: string;
+}
+
+export const VISUAL_STYLE_OPTIONS: readonly VisualStyleOption[] = [
+  {
+    id: 'pixar_3d',
+    name: 'Classic / Pixar-Inspired 3D',
+    tagline: 'Rich lighting · Detailed textures',
+    description:
+      'Features expressive proportions, rich lighting, and detailed textures while keeping a clearly cartoon aesthetic.',
+  },
+  {
+    id: 'stylized_3d',
+    name: 'Stylized 3D',
+    tagline: 'Bold colors · Simplified shapes',
+    description:
+      'Uses exaggerated anatomy, bold colors, and simplified shapes for high visual clarity and personality.',
+  },
+  {
+    id: 'cel_shaded_npr',
+    name: 'Cel-Shaded / Non-Photorealistic (NPR)',
+    tagline: 'Flat color blocks · Crisp outlines',
+    description:
+      'Renders 3D models with flat color blocks and outlines to mimic 2D hand-drawn or comic-book art.',
+  },
+  {
+    id: 'low_poly',
+    name: 'Low Poly',
+    tagline: 'Minimal polygons · Sharp facets',
+    description:
+      'Relies on minimal polygons and sharp geometric facets for a clean, blocky, or minimalist look.',
+  },
+  {
+    id: 'chibi_sd',
+    name: 'Chibi / Super-Deformed',
+    tagline: 'Large heads · Compact limbs',
+    description:
+      'Shrinks body proportions with large heads and small limbs for cute, comedic characters.',
+  },
+  {
+    id: 'stop_motion_clay',
+    name: 'Stop-Motion / Clay-Inspired 3D',
+    tagline: 'Handcrafted clay · Tactile motion',
+    description:
+      'Digitally replicates physical clay, puppet, or tactile handcrafted textures and frame motion.',
+  },
+] as const;
+
 export type JobStatus = 'queued' | 'processing' | 'completed' | 'failed';
 export type SceneStatus = 'pending' | 'generating' | 'completed' | 'failed';
 export type AppScreen = 'home' | 'processing' | 'result' | 'history' | 'deliverables';
@@ -62,6 +122,8 @@ export interface SceneSegment {
 export interface ConversionJob {
   jobId: string;
   originalFilename: string;
+  visualStyle: VisualStyleId;
+  visualStyleLabel: string;
   status: JobStatus;
   progress: number;
   currentStage: number;

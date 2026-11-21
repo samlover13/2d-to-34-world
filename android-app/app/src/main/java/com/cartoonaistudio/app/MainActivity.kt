@@ -34,12 +34,14 @@ class MainActivity : ComponentActivity() {
                 when (uiState.route) {
                     ScreenRoute.HOME -> HomeScreen(
                         selectedVideo = uiState.selectedVideo,
+                        selectedStyleId = uiState.selectedStyleId,
                         recentHistory = history,
                         isUploading = uiState.isUploading,
                         errorMessage = uiState.errorMessage,
                         isDarkTheme = isDarkTheme,
                         onToggleTheme = { isDarkTheme = !isDarkTheme },
                         onVideoPicked = viewModel::onVideoSelected,
+                        onStyleSelected = viewModel::onStyleSelected,
                         onConvertClick = viewModel::startConversion,
                         onOpenHistoryJob = viewModel::openHistoryJob
                     )

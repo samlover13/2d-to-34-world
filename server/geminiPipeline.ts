@@ -20,7 +20,13 @@ import {
   normalizeClipToScene,
   sliceSceneVideo,
 } from './ffmpeg.ts';
-import { CharacterProfile, SceneSegment, VideoMetadata } from './types.ts';
+import {
+  CharacterProfile,
+  SceneSegment,
+  VideoMetadata,
+  VisualStyleDefinition,
+  resolveVisualStyle,
+} from './types.ts';
 
 const activeJobs = new Set<string>();
 
@@ -207,7 +213,8 @@ function buildConsistentScenes(
   rawScenes: RawGeminiAnalysis['scenes'],
   totalDurationSec: number,
   characters: CharacterProfile[],
-  overallStyleNotes: string
+  overallStyleNotes: string,
+  visualStyle: VisualStyleDefinition
 ): SceneSegment[] {
   const MAX_CLIP_SEC = 10;
   const MIN_CLIP_SEC = 3;
@@ -224,10 +231,10 @@ function buildConsistentScenes(
     sorted.push({
       startSec: 0,
       endSec: totalDurationSec,
-      summary: 'Complete cartoon sequence transformed into cinematic 3D anime.',
+      summary: `Complete cartoon sequence transformed into ${visualStyle.name}.`,
       expressionsAndActions: 'Preserve all original character movements and facial expressions.',
       cameraAndMovement: 'Preserve original camera framing and motion.',
-      backgroundAndLighting: 'Rich volumetric 3D anime environment with cinematic lighting.',
+      backgroundAndLighting: `Cohesive ${visualStyle.name} environment and lighting.`,
       characterIds: characters.map((c) => c.characterId),
     });
   }
@@ -283,10 +290,10 @@ function buildConsistentScenes(
       .join(' ');
 
     const conversionPrompt = [
-      `Transform this 2D cartoon video scene into a high-budget theatrical 3D CG Anime film sequence.`,
+      `Transform this 2D cartoon video scene into a polished ${visualStyle.name} 3D animated sequence.`,
       `Keep exact scene composition, character positions, poses, actions, camera movement, and timing identical to the input video.`,
-      `STYLE: Polished modern 3D anime rendering (Makoto Shinkai / high-end Japanese 3D CG anime cinema), subsurface skin scattering, sculpted layered 3D anime hair strands, crisp cloth weave textures, volumetric cinematic lighting, soft depth of field. ${overallStyleNotes}`,
-      `STRICT CHARACTER CONSISTENCY (do NOT alter faces, hairstyles, outfits, body proportions, or colors): ${charLockBlock}`,
+      `TARGET VISUAL STYLE (${visualStyle.name}): ${visualStyle.videoSceneDirective} ${overallStyleNotes}`,
+      `STRICT CHARACTER CONSISTENCY (do NOT alter faces, hairstyles, outfits, or colors across scenes): ${charLockBlock}`,
       `SCENE ACTION (${entry.startSec.toFixed(1)}s to ${entry.endSec.toFixed(1)}s): ${entry.template.summary}. Expressions & movement: ${entry.template.expressionsAndActions}. Camera: ${entry.template.cameraAndMovement}. Environment & lighting: ${entry.template.backgroundAndLighting}.`,
     ].join('\n');
 
@@ -334,6 +341,7 @@ async function runJobPipeline(jobId: string): Promise<void> {
   if (!rawJob) return;
 
   const metadata = JSON.parse(rawJob.metadata_json) as VideoMetadata;
+  const visualStyle = resolveVisualStyle(rawJob.visual_style);
   const jobDir = getJobWorkDir(jobId);
   const assetsDir = path.join(jobDir, 'assets');
   const framesDir = path.join(jobDir, 'frames');
@@ -403,10 +411,11 @@ async function runJobPipeline(jobId: string): Promise<void> {
       updateJobFields(jobId, {
         current_stage: 3,
         progress: 30,
-        stage_detail: 'Gemini analyzing every scene, character trait, expression, movement, and background...',
+        stage_detail: `Gemini analyzing every scene, character trait, movement, and background for ${visualStyle.name}...`,
       });
 
       const analysisPrompt = `Analyze the ENTIRE uploaded 2D cartoon video from 0.0s to ${metadata.durationSec.toFixed(2)}s (not just the first frame).
+Target 3D conversion style: ${visualStyle.name} — ${visualStyle.description}
 1. Identify EVERY recurring character across the complete video and create a strict visual consistency sheet for each:
    - characterId (e.g. "CHAR_01", "CHAR_02")
    - name (descriptive name or role)
@@ -416,7 +425,7 @@ async function runJobPipeline(jobId: string): Promise<void> {
    - startSec, endSec
    - summary, expressionsAndActions, cameraAndMovement, backgroundAndLighting
    - characterIds: array of characterId values visible in that scene.
-3. Provide overallStyleNotes describing cohesive 3D Anime cinematic lighting, palette harmony, and environmental textures suitable for the entire video.`;
+3. Provide overallStyleNotes specifically tailored to "${visualStyle.name}": ${visualStyle.analysisGuidance}`;
 
       const geminiResponse = await withModelFailover(
         'Gemini video analysis',
@@ -562,7 +571,7 @@ async function runJobPipeline(jobId: string): Promise<void> {
       updateJobFields(jobId, {
         current_stage: 5,
         progress: 45,
-        stage_detail: `Generating 3D Anime reference sheets for ${characters.length} detected character(s)...`,
+        stage_detail: `Generating ${visualStyle.name} reference sheets for ${characters.length} detected character(s)...`,
       });
 
       const charsToProcess = characters.slice(0, 4);
@@ -581,19 +590,19 @@ async function runJobPipeline(jobId: string): Promise<void> {
 
         if (!fs.existsSync(animeRefPath)) {
           const sourceB64 = fs.readFileSync(sourcePath).toString('base64');
-          const refPrompt = `Transform the character "${char.name}" (${char.characterId}) shown in this 2D cartoon frame into a clean, high-budget 3D CG Anime character reference portrait on a neutral soft studio background.
-Preserve exact identity and visual traits strictly:
+          const refPrompt = `Transform the character "${char.name}" (${char.characterId}) shown in this 2D cartoon frame into a clean ${visualStyle.name} character reference portrait on a neutral soft studio background.
+Preserve exact character identity and visual traits strictly:
 - Facial features: ${char.facialFeatures}
 - Hair: ${char.hairStyleAndColor}
 - Eyes: ${char.eyeShapeAndColor}
 - Clothing & accessories: ${char.clothingAndAccessories}
-- Proportions: ${char.bodyProportions}
+- Source proportions: ${char.bodyProportions}
 - Colors: ${char.colorPalette}
 - Distinctive features: ${char.distinctiveFeatures}
-Render with theatrical 3D anime skin subsurface scattering, sculpted hair strands, fabric textures, and crisp neutral reference lighting.`;
+TARGET VISUAL STYLE (${visualStyle.name}): ${visualStyle.characterRefDirective}`;
 
           const refImgRes = await withModelFailover(
-            `3D anime reference for ${char.name}`,
+            `${visualStyle.name} reference for ${char.name}`,
             ['gemini-3.1-flash-lite-image', 'gemini-nano-banana-2.1'],
             (model) =>
               ai.models.generateContent({
@@ -631,7 +640,7 @@ Render with theatrical 3D anime skin subsurface scattering, sculpted hair strand
         const pct = 45 + Math.round(((i + 1) / Math.max(1, charsToProcess.length)) * 8);
         updateJobFields(jobId, {
           progress: pct,
-          stage_detail: `Created 3D Anime consistency profile ${i + 1} of ${charsToProcess.length} (${char.name}).`,
+          stage_detail: `Created ${visualStyle.name} consistency profile ${i + 1} of ${charsToProcess.length} (${char.name}).`,
         });
       }
 
@@ -640,7 +649,7 @@ Render with theatrical 3D anime skin subsurface scattering, sculpted hair strand
       updateJobFields(jobId, {
         last_completed_stage: 5,
         progress: 53,
-        stage_detail: 'Persistent 3D Anime character reference profiles ready.',
+        stage_detail: `Persistent ${visualStyle.name} character reference profiles ready.`,
       });
     }
 
@@ -652,14 +661,15 @@ Render with theatrical 3D anime skin subsurface scattering, sculpted hair strand
       updateJobFields(jobId, {
         current_stage: 6,
         progress: 56,
-        stage_detail: 'Segmenting source timeline into chronological scenes and locking character consistency prompts...',
+        stage_detail: `Segmenting source timeline into chronological scenes and locking ${visualStyle.name} prompts...`,
       });
 
       const builtScenes = buildConsistentScenes(
         analysis?.scenes ?? [],
         metadata.durationSec,
         characters,
-        analysis?.overallStyleNotes ?? ''
+        analysis?.overallStyleNotes ?? '',
+        visualStyle
       );
 
       for (const scene of builtScenes) {
@@ -716,7 +726,7 @@ Render with theatrical 3D anime skin subsurface scattering, sculpted hair strand
           current_stage: 7,
           progress: 60 + Math.round((i / scenes.length) * 25),
           estimated_seconds_remaining: etaSec,
-          stage_detail: `Veo generating 3D Anime scene ${i + 1} of ${scenes.length} (${scene.startSec.toFixed(1)}s – ${scene.endSec.toFixed(1)}s)...`,
+          stage_detail: `Veo generating ${visualStyle.name} scene ${i + 1} of ${scenes.length} (${scene.startSec.toFixed(1)}s – ${scene.endSec.toFixed(1)}s)...`,
         });
 
         const sceneStartTs = Date.now();
@@ -885,7 +895,7 @@ Render with theatrical 3D anime skin subsurface scattering, sculpted hair strand
         last_completed_stage: 7,
         progress: 86,
         estimated_seconds_remaining: 12,
-        stage_detail: `All ${scenes.length} 3D Anime scene clip(s) generated by Veo.`,
+        stage_detail: `All ${scenes.length} ${visualStyle.name} scene clip(s) generated by Veo.`,
       });
     }
 
@@ -961,7 +971,7 @@ Render with theatrical 3D anime skin subsurface scattering, sculpted hair strand
       output_path: finalMp4Path,
       output_metadata_json: JSON.stringify(outputMetadata),
       error_message: null,
-      stage_detail: `Completed 3D Anime MP4 (${outputMetadata.width}x${outputMetadata.height}, ${outputMetadata.durationSec.toFixed(1)}s).`,
+      stage_detail: `Completed ${visualStyle.name} MP4 (${outputMetadata.width}x${outputMetadata.height}, ${outputMetadata.durationSec.toFixed(1)}s).`,
     });
   } catch (err) {
     const friendlyError = formatGeminiError(err);

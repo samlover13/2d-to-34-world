@@ -3,12 +3,15 @@ import fs from 'fs';
 import path from 'path';
 import {
   CharacterProfile,
+  DEFAULT_VISUAL_STYLE,
   JobResponse,
   JobStatus,
   PIPELINE_STAGES,
   SceneSegment,
   SceneStatus,
   VideoMetadata,
+  VisualStyleId,
+  resolveVisualStyle,
 } from './types.ts';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
@@ -23,6 +26,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
     original_filename TEXT NOT NULL,
+    visual_style TEXT NOT NULL DEFAULT 'pixar_3d',
     input_path TEXT NOT NULL,
     audio_path TEXT,
     output_path TEXT,
@@ -82,9 +86,16 @@ db.exec(`
   );
 `);
 
+// Safe schema migration for existing SQLite databases created prior to visual_style support
+const existingCols = db.prepare("PRAGMA table_info('jobs')").all() as Array<{ name: string }>;
+if (!existingCols.some((col) => col.name === 'visual_style')) {
+  db.exec(`ALTER TABLE jobs ADD COLUMN visual_style TEXT NOT NULL DEFAULT '${DEFAULT_VISUAL_STYLE}'`);
+}
+
 export interface RawJobRow {
   job_id: string;
   original_filename: string;
+  visual_style: string;
   input_path: string;
   audio_path: string | null;
   output_path: string | null;
@@ -138,19 +149,21 @@ interface RawSceneRow {
 export function createJobRecord(params: {
   jobId: string;
   originalFilename: string;
+  visualStyle: VisualStyleId;
   inputPath: string;
   metadata: VideoMetadata;
 }): void {
   const now = new Date().toISOString();
   db.prepare(
     `INSERT INTO jobs (
-      job_id, original_filename, input_path, status, progress,
+      job_id, original_filename, visual_style, input_path, status, progress,
       current_stage, last_completed_stage, stage_detail,
       metadata_json, created_at, updated_at
-    ) VALUES (?, ?, ?, 'queued', 5, 1, 1, 'Video validated and queued for frame extraction.', ?, ?, ?)`
+    ) VALUES (?, ?, ?, ?, 'queued', 5, 1, 1, 'Video validated and queued for frame extraction.', ?, ?, ?)`
   ).run(
     params.jobId,
     params.originalFilename,
+    params.visualStyle,
     params.inputPath,
     JSON.stringify(params.metadata),
     now,
@@ -404,6 +417,7 @@ export function getScenesForJob(jobId: string): SceneSegment[] {
 function hydrateJob(row: RawJobRow): JobResponse {
   const stageDef =
     PIPELINE_STAGES.find((s) => s.id === row.current_stage) ?? PIPELINE_STAGES[0];
+  const styleDef = resolveVisualStyle(row.visual_style);
   const characters = getCharactersForJob(row.job_id);
   const scenes = getScenesForJob(row.job_id);
   const hasOutputVideo = Boolean(row.output_path && fs.existsSync(row.output_path));
@@ -411,6 +425,8 @@ function hydrateJob(row: RawJobRow): JobResponse {
   return {
     jobId: row.job_id,
     originalFilename: row.original_filename,
+    visualStyle: styleDef.id,
+    visualStyleLabel: styleDef.name,
     status: row.status,
     progress: row.progress,
     currentStage: row.current_stage,

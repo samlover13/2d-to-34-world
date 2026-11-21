@@ -53,6 +53,8 @@ data class SceneSegmentDto(
 data class JobStatusDto(
     @SerializedName("jobId") val jobId: String,
     @SerializedName("originalFilename") val originalFilename: String,
+    @SerializedName("visualStyle") val visualStyle: String = "pixar_3d",
+    @SerializedName("visualStyleLabel") val visualStyleLabel: String = "Classic / Pixar-Inspired 3D",
     @SerializedName("status") val status: String,
     @SerializedName("progress") val progress: Int,
     @SerializedName("currentStage") val currentStage: Int,
@@ -80,4 +82,43 @@ val PIPELINE_STAGE_LABELS = listOf(
     8 to "Combining generated scenes",
     9 to "Synchronizing original audio",
     10 to "Rendering final MP4"
+)
+
+data class VisualStyleOption(
+    val id: String,
+    val name: String,
+    val description: String
+)
+
+val VISUAL_STYLE_OPTIONS = listOf(
+    VisualStyleOption(
+        id = "pixar_3d",
+        name = "Classic / Pixar-Inspired 3D",
+        description = "Features expressive proportions, rich lighting, and detailed textures while keeping a clearly cartoon aesthetic."
+    ),
+    VisualStyleOption(
+        id = "stylized_3d",
+        name = "Stylized 3D",
+        description = "Uses exaggerated anatomy, bold colors, and simplified shapes for high visual clarity and personality."
+    ),
+    VisualStyleOption(
+        id = "cel_shaded_npr",
+        name = "Cel-Shaded / Non-Photorealistic (NPR)",
+        description = "Renders 3D models with flat color blocks and outlines to mimic 2D hand-drawn or comic-book art."
+    ),
+    VisualStyleOption(
+        id = "low_poly",
+        name = "Low Poly",
+        description = "Relies on minimal polygons and sharp geometric facets for a clean, blocky, or minimalist look."
+    ),
+    VisualStyleOption(
+        id = "chibi_sd",
+        name = "Chibi / Super-Deformed",
+        description = "Shrinks body proportions with large heads and small limbs for cute, comedic characters."
+    ),
+    VisualStyleOption(
+        id = "stop_motion_clay",
+        name = "Stop-Motion / Clay-Inspired 3D",
+        description = "Digitally replicates physical clay, puppet, or tactile handcrafted textures and frame motion."
+    )
 )

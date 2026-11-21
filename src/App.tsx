@@ -185,6 +185,7 @@ export default function App() {
                           {job.originalFilename}
                         </p>
                         <p className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums mt-0.5">
+                          <span className="font-sans">{job.visualStyleLabel}</span> ·{' '}
                           {formatDuration(job.metadata.durationSec)} · {job.metadata.width}x
                           {job.metadata.height} · {job.characters.length} character(s) ·{' '}
                           {job.scenes.length} scene(s) ·{' '}

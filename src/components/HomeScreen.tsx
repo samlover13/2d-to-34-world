@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   ArrowRight,
+  Check,
   CheckCircle2,
   ChevronRight,
   Clock,
@@ -13,7 +14,13 @@ import {
   Upload,
 } from 'lucide-react';
 import React, { useEffect, useRef, useState } from 'react';
-import { ConversionJob, formatBytes, formatDuration } from '../types';
+import {
+  ConversionJob,
+  VISUAL_STYLE_OPTIONS,
+  VisualStyleId,
+  formatBytes,
+  formatDuration,
+} from '../types';
 
 const SAMPLE_2D_IMG = '/src/assets/images/sample_2d_cartoon_frame_1795248082485.jpg';
 const SAMPLE_3D_IMG = '/src/assets/images/sample_3d_anime_frame_1795248082337.jpg';
@@ -47,6 +54,7 @@ export function HomeScreen({
   onViewAllHistory,
 }: HomeScreenProps) {
   const [selectedVideo, setSelectedVideo] = useState<LocalVideoSelection | null>(null);
+  const [selectedStyle, setSelectedStyle] = useState<VisualStyleId>('pixar_3d');
   const [validationError, setValidationError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -54,6 +62,9 @@ export function HomeScreen({
   const [isDragging, setIsDragging] = useState(false);
   const [sliderPos, setSliderPos] = useState(50);
   const [imgErrors, setImgErrors] = useState<Record<string, boolean>>({});
+
+  const activeStyleOption =
+    VISUAL_STYLE_OPTIONS.find((opt) => opt.id === selectedStyle) ?? VISUAL_STYLE_OPTIONS[0];
 
   const previewUrlRef = useRef<string | null>(null);
 
@@ -177,6 +188,7 @@ export function HomeScreen({
     try {
       const formData = new FormData();
       formData.append('video', selectedVideo.file);
+      formData.append('visual_style', selectedStyle);
 
       const createdJob = await new Promise<ConversionJob>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
@@ -368,6 +380,73 @@ export function HomeScreen({
             </div>
           )}
 
+          {/* 3D Cartoon Visual Style Selector */}
+          <div className="mt-6 pt-5 border-t border-zinc-200 dark:border-white/8">
+            <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+              <div>
+                <h3 className="font-display text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                  3D Cartoon Visual Style
+                </h3>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+                  Applied consistently across Gemini character sheets and every Veo scene
+                </p>
+              </div>
+              <span className="text-xs font-medium text-blue-600 dark:text-blue-400">
+                {activeStyleOption.name}
+              </span>
+            </div>
+
+            <div
+              role="radiogroup"
+              aria-label="Select 3D Cartoon Visual Style"
+              className="grid grid-cols-1 sm:grid-cols-2 gap-2.5"
+            >
+              {VISUAL_STYLE_OPTIONS.map((styleOpt) => {
+                const isSelected = styleOpt.id === selectedStyle;
+                return (
+                  <button
+                    key={styleOpt.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={isSelected}
+                    disabled={isUploading}
+                    onClick={() => setSelectedStyle(styleOpt.id)}
+                    className={`text-left p-3.5 min-h-[44px] rounded-xl border transition-colors flex flex-col justify-between gap-1.5 disabled:opacity-60 ${
+                      isSelected
+                        ? 'border-blue-600 dark:border-blue-500 bg-blue-50/80 dark:bg-blue-500/12'
+                        : 'border-zinc-200 dark:border-white/10 bg-zinc-50/60 dark:bg-[#0E1118] hover:border-zinc-300 dark:hover:border-white/20 hover:bg-zinc-50 dark:hover:bg-[#161B26]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2 w-full">
+                      <span
+                        className={`text-sm font-semibold leading-snug ${
+                          isSelected
+                            ? 'text-blue-700 dark:text-blue-300'
+                            : 'text-zinc-900 dark:text-zinc-100'
+                        }`}
+                      >
+                        {styleOpt.name}
+                      </span>
+                      <span
+                        aria-hidden="true"
+                        className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-colors ${
+                          isSelected
+                            ? 'border-blue-600 bg-blue-600 text-white'
+                            : 'border-zinc-300 dark:border-white/20 bg-transparent'
+                        }`}
+                      >
+                        {isSelected && <Check className="w-3 h-3 stroke-[2.75]" />}
+                      </span>
+                    </div>
+                    <p className="text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+                      {styleOpt.description}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           {validationError && (
             <div
               role="alert"
@@ -381,7 +460,7 @@ export function HomeScreen({
           {/* Primary Convert CTA */}
           <div className="mt-6 pt-5 border-t border-zinc-200 dark:border-white/8 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="text-xs text-zinc-500 dark:text-zinc-400">
-              Output: H.264 MP4 · AAC original audio · 720p minimum · Automatic character lock
+              Style: {activeStyleOption.name} · H.264 MP4 · AAC original audio · Automatic character lock
             </div>
 
             <button
@@ -397,7 +476,7 @@ export function HomeScreen({
                 </>
               ) : (
                 <>
-                  <span>Convert to 3D Anime</span>
+                  <span>Convert to 3D</span>
                   <ArrowRight className="w-4 h-4" aria-hidden="true" />
                 </>
               )}
@@ -561,6 +640,8 @@ export function HomeScreen({
                       <span>
                         {job.metadata.width}x{job.metadata.height}
                       </span>
+                      <span aria-hidden="true">·</span>
+                      <span className="font-sans">{job.visualStyleLabel}</span>
                       <span aria-hidden="true">·</span>
                       <span className="font-sans">
                         {job.status === 'completed'

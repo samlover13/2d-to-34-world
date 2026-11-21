@@ -7,8 +7,16 @@ Both the live Node/Express server (`server.ts`) and the production Python FastAP
 ## 1. Create Conversion Job
 **`POST /api/jobs`**
 - **Content-Type:** `multipart/form-data`
-- **Field:** `video` (`.mp4` or `.mov`, max `60` seconds, max `150 MB`)
-- **Validation:** Probes the uploaded stream with `ffprobe`. Rejects unsupported containers or durations > 60s with HTTP `400`.
+- **Fields:**
+  - `video` (`.mp4` or `.mov`, max `60` seconds, max `150 MB`)
+  - `visual_style` (optional, default `pixar_3d`) — Allowlist-validated 3D Cartoon Visual Style ID:
+    - `pixar_3d` — Classic / Pixar-Inspired 3D
+    - `stylized_3d` — Stylized 3D
+    - `cel_shaded_npr` — Cel-Shaded / Non-Photorealistic (NPR)
+    - `low_poly` — Low Poly
+    - `chibi_sd` — Chibi / Super-Deformed
+    - `stop_motion_clay` — Stop-Motion / Clay-Inspired 3D
+- **Validation:** Probes the uploaded stream with `ffprobe`. Rejects unsupported containers or durations > 60s with HTTP `400`. Unknown `visual_style` values safely default to `pixar_3d`.
 - **Response (`201 Created`):**
 ```json
 {
@@ -16,6 +24,8 @@ Both the live Node/Express server (`server.ts`) and the production Python FastAP
   "job": {
     "jobId": "550e8400-e29b-41d4-a716-446655440000",
     "originalFilename": "episode_clip.mp4",
+    "visualStyle": "stop_motion_clay",
+    "visualStyleLabel": "Stop-Motion / Clay-Inspired 3D",
     "status": "queued",
     "progress": 5,
     "currentStage": 1,

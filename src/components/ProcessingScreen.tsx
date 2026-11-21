@@ -67,10 +67,10 @@ export function ProcessingScreen({
           </button>
           <div className="min-w-0">
             <h1 className="font-display text-xl sm:text-2xl font-bold text-zinc-900 dark:text-zinc-50 truncate">
-              Converting to 3D Anime
+              Converting to {job.visualStyleLabel}
             </h1>
             <p className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums truncate">
-              {job.originalFilename} · {formatDuration(job.metadata.durationSec)} ·{' '}
+              {job.originalFilename} · {job.visualStyleLabel} · {formatDuration(job.metadata.durationSec)} ·{' '}
               {job.metadata.width}x{job.metadata.height} ({job.metadata.orientation})
             </p>
           </div>

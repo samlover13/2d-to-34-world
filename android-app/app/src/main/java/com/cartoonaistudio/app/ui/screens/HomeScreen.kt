@@ -30,6 +30,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.cartoonaistudio.app.data.ConversionHistoryEntity
+import com.cartoonaistudio.app.data.VISUAL_STYLE_OPTIONS
 import com.cartoonaistudio.app.util.LocalVideoInfo
 import com.cartoonaistudio.app.util.VideoUtils
 
@@ -37,12 +38,14 @@ import com.cartoonaistudio.app.util.VideoUtils
 @Composable
 fun HomeScreen(
     selectedVideo: LocalVideoInfo?,
+    selectedStyleId: String,
     recentHistory: List<ConversionHistoryEntity>,
     isUploading: Boolean,
     errorMessage: String?,
     isDarkTheme: Boolean,
     onToggleTheme: () -> Unit,
     onVideoPicked: (Uri) -> Unit,
+    onStyleSelected: (String) -> Unit,
     onConvertClick: () -> Unit,
     onOpenHistoryJob: (String) -> Unit
 ) {
@@ -188,6 +191,68 @@ fun HomeScreen(
                                         Text("Uploading...")
                                     } else {
                                         Text("Convert to 3D Anime")
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
+
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                text = "3D Cartoon Visual Style",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            VISUAL_STYLE_OPTIONS.forEach { option ->
+                                val isSelected = option.id == selectedStyleId
+                                Surface(
+                                    shape = RoundedCornerShape(14.dp),
+                                    color = if (isSelected) {
+                                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                                    } else {
+                                        MaterialTheme.colorScheme.surface
+                                    },
+                                    border = BorderStroke(
+                                        width = if (isSelected) 1.5.dp else 1.dp,
+                                        color = if (isSelected) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.outline
+                                        }
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable(enabled = !isUploading) { onStyleSelected(option.id) }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalAlignment = Alignment.Top,
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        RadioButton(
+                                            selected = isSelected,
+                                            onClick = null,
+                                            modifier = Modifier.padding(top = 2.dp)
+                                        )
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = option.name,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = if (isSelected) {
+                                                    MaterialTheme.colorScheme.primary
+                                                } else {
+                                                    MaterialTheme.colorScheme.onSurface
+                                                }
+                                            )
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = option.description,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
                                     }
                                 }
                             }

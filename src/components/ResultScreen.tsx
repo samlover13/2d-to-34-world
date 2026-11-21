@@ -133,9 +133,11 @@ export function ResultScreen({ job, onConvertAnother }: ResultScreenProps) {
             Conversion Complete · H.264 / AAC MP4 Ready
           </p>
           <h1 className="font-display text-2xl sm:text-3xl font-bold text-zinc-900 dark:text-zinc-50 mt-0.5">
-            3D Anime Video Ready
+            {job.visualStyleLabel} Video Ready
           </h1>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
+            <span className="font-sans">{job.visualStyleLabel}</span>
+            <span aria-hidden="true">·</span>
             <span>{outMeta.width}x{outMeta.height}</span>
             <span aria-hidden="true">·</span>
             <span>{outMeta.durationSec.toFixed(1)}s</span>

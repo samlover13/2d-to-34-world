@@ -28,6 +28,7 @@ class ConversionJob(Base):
 
     job_id = Column(String(64), primary_key=True, index=True)
     original_filename = Column(String(255), nullable=False)
+    visual_style = Column(String(64), nullable=False, default="pixar_3d")
     input_path = Column(Text, nullable=False)
     gcs_input_uri = Column(Text, nullable=True)
     audio_path = Column(Text, nullable=True)
