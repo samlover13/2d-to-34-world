@@ -1,0 +1,6 @@
+{
+  "name": "Cartoon AI Studio",
+  "description": "2D Cartoon to 3D Anime AI Video Converter powered by Google Gemini, Veo, and FFmpeg, with native Android Kotlin/Jetpack Compose and Python FastAPI deliverables.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
