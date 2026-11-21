@@ -41,15 +41,39 @@ function createGeminiClient(): GoogleGenAI {
   });
 }
 
+function isTransientOverloadError(rawMsg: string): boolean {
+  const lower = rawMsg.toLowerCase();
+  return (
+    rawMsg.includes('503') ||
+    rawMsg.includes('UNAVAILABLE') ||
+    rawMsg.includes('OVERLOADED') ||
+    lower.includes('high demand') ||
+    lower.includes('temporarily unavailable')
+  );
+}
+
 function formatGeminiError(err: unknown): string {
-  const msg = err instanceof Error ? err.message : String(err);
-  if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+  const raw = err instanceof Error ? err.message : String(err);
+  let msg = raw;
+  try {
+    const parsed = JSON.parse(raw) as { error?: { message?: string; status?: string; code?: number } };
+    if (parsed?.error?.message) {
+      msg = `${parsed.error.message}${parsed.error.status ? ` (${parsed.error.code ?? ''} ${parsed.error.status})` : ''}`.trim();
+    }
+  } catch {
+    // Not raw JSON
+  }
+
+  if (isTransientOverloadError(raw)) {
+    return 'Google Gemini / Veo is temporarily experiencing high demand (503 UNAVAILABLE). All completed stages are saved — click Resume to continue from your last checkpoint.';
+  }
+  if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
     return 'Google Gemini / Veo quota limit reached (429 RESOURCE_EXHAUSTED). Please check your billing-enabled API key in Settings > Secrets and click Resume from Last Stage.';
   }
-  if (msg.includes('403') || msg.includes('PERMISSION_DENIED') || msg.includes('API_KEY_INVALID')) {
+  if (raw.includes('403') || raw.includes('PERMISSION_DENIED') || raw.includes('API_KEY_INVALID')) {
     return 'Gemini API authentication failed (403/400). Please verify your billing-enabled GEMINI_API_KEY in Settings > Secrets and click Resume.';
   }
-  if (msg.includes('404') || msg.includes('NOT_FOUND')) {
+  if (raw.includes('404') || raw.includes('NOT_FOUND')) {
     return `Gemini model endpoint returned 404 Not Found: ${msg}`;
   }
   return msg;
@@ -58,7 +82,8 @@ function formatGeminiError(err: unknown): string {
 async function withRetry<T>(
   operationName: string,
   fn: () => Promise<T>,
-  maxAttempts = 3
+  maxAttempts = 4,
+  onRetry?: (attempt: number, maxAttempts: number, delayMs: number, reason: string) => void
 ): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -74,11 +99,52 @@ async function withRetry<T>(
       if (isPermanent || attempt === maxAttempts) {
         throw err;
       }
-      const delayMs = Math.min(25000, 3000 * Math.pow(2, attempt - 1));
+      const jitter = Math.floor(Math.random() * 1500);
+      const delayMs = Math.min(28000, 3500 * Math.pow(2, attempt - 1)) + jitter;
+      const reason = isTransientOverloadError(rawMsg)
+        ? 'High model demand (503)'
+        : 'Temporary API error';
       console.warn(
-        `[Pipeline] ${operationName} attempt ${attempt}/${maxAttempts} failed (${rawMsg}). Retrying in ${delayMs}ms...`
+        `[Pipeline] ${operationName} attempt ${attempt}/${maxAttempts} failed (${reason}). Retrying in ${delayMs}ms...`
       );
+      onRetry?.(attempt, maxAttempts, delayMs, reason);
       await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
+}
+
+async function withModelFailover<T>(
+  operationName: string,
+  models: string[],
+  fn: (model: string) => Promise<T>,
+  onStatus?: (message: string) => void
+): Promise<T> {
+  let lastError: unknown;
+  for (let idx = 0; idx < models.length; idx++) {
+    const model = models[idx];
+    const hasFallback = idx < models.length - 1;
+    try {
+      return await withRetry(
+        `${operationName} [${model}]`,
+        () => fn(model),
+        hasFallback ? 2 : 3,
+        (attempt, maxAttempts, delayMs, reason) => {
+          onStatus?.(
+            `${reason} on ${model} — retrying automatically (${attempt + 1}/${maxAttempts}) in ${Math.round(delayMs / 1000)}s...`
+          );
+        }
+      );
+    } catch (err) {
+      lastError = err;
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      if (hasFallback && (isTransientOverloadError(rawMsg) || rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED'))) {
+        const nextModel = models[idx + 1];
+        console.warn(`[Pipeline] ${operationName}: ${model} busy/unavailable, failing over to ${nextModel}...`);
+        onStatus?.(`${model} experiencing high demand — automatically switching to ${nextModel}...`);
+        continue;
+      }
+      throw err;
     }
   }
   throw lastError;
@@ -352,91 +418,97 @@ async function runJobPipeline(jobId: string): Promise<void> {
    - characterIds: array of characterId values visible in that scene.
 3. Provide overallStyleNotes describing cohesive 3D Anime cinematic lighting, palette harmony, and environmental textures suitable for the entire video.`;
 
-      const geminiResponse = await withRetry('Gemini video analysis', () =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  fileData: {
-                    fileUri: uploadedFullVideo.uri,
-                    mimeType: 'video/mp4',
-                  },
-                },
-                { text: analysisPrompt },
-              ],
-            },
-          ],
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                overallStyleNotes: { type: Type.STRING },
-                characters: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      characterId: { type: Type.STRING },
-                      name: { type: Type.STRING },
-                      facialFeatures: { type: Type.STRING },
-                      hairStyleAndColor: { type: Type.STRING },
-                      eyeShapeAndColor: { type: Type.STRING },
-                      clothingAndAccessories: { type: Type.STRING },
-                      bodyProportions: { type: Type.STRING },
-                      colorPalette: { type: Type.STRING },
-                      distinctiveFeatures: { type: Type.STRING },
-                      bestFrameTimestampSec: { type: Type.NUMBER },
+      const geminiResponse = await withModelFailover(
+        'Gemini video analysis',
+        ['gemini-4-hydrogen', 'gemini-4-neon', 'gemini-3.1-flash-lite'],
+        (model) =>
+          ai.models.generateContent({
+            model,
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    fileData: {
+                      fileUri: uploadedFullVideo.uri,
+                      mimeType: 'video/mp4',
                     },
-                    required: [
-                      'characterId',
-                      'name',
-                      'facialFeatures',
-                      'hairStyleAndColor',
-                      'eyeShapeAndColor',
-                      'clothingAndAccessories',
-                      'bodyProportions',
-                      'colorPalette',
-                      'distinctiveFeatures',
-                      'bestFrameTimestampSec',
-                    ],
                   },
-                },
-                scenes: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      startSec: { type: Type.NUMBER },
-                      endSec: { type: Type.NUMBER },
-                      summary: { type: Type.STRING },
-                      expressionsAndActions: { type: Type.STRING },
-                      cameraAndMovement: { type: Type.STRING },
-                      backgroundAndLighting: { type: Type.STRING },
-                      characterIds: {
-                        type: Type.ARRAY,
-                        items: { type: Type.STRING },
-                      },
-                    },
-                    required: [
-                      'startSec',
-                      'endSec',
-                      'summary',
-                      'expressionsAndActions',
-                      'cameraAndMovement',
-                      'backgroundAndLighting',
-                      'characterIds',
-                    ],
-                  },
-                },
+                  { text: analysisPrompt },
+                ],
               },
-              required: ['overallStyleNotes', 'characters', 'scenes'],
+            ],
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  overallStyleNotes: { type: Type.STRING },
+                  characters: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        characterId: { type: Type.STRING },
+                        name: { type: Type.STRING },
+                        facialFeatures: { type: Type.STRING },
+                        hairStyleAndColor: { type: Type.STRING },
+                        eyeShapeAndColor: { type: Type.STRING },
+                        clothingAndAccessories: { type: Type.STRING },
+                        bodyProportions: { type: Type.STRING },
+                        colorPalette: { type: Type.STRING },
+                        distinctiveFeatures: { type: Type.STRING },
+                        bestFrameTimestampSec: { type: Type.NUMBER },
+                      },
+                      required: [
+                        'characterId',
+                        'name',
+                        'facialFeatures',
+                        'hairStyleAndColor',
+                        'eyeShapeAndColor',
+                        'clothingAndAccessories',
+                        'bodyProportions',
+                        'colorPalette',
+                        'distinctiveFeatures',
+                        'bestFrameTimestampSec',
+                      ],
+                    },
+                  },
+                  scenes: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        startSec: { type: Type.NUMBER },
+                        endSec: { type: Type.NUMBER },
+                        summary: { type: Type.STRING },
+                        expressionsAndActions: { type: Type.STRING },
+                        cameraAndMovement: { type: Type.STRING },
+                        backgroundAndLighting: { type: Type.STRING },
+                        characterIds: {
+                          type: Type.ARRAY,
+                          items: { type: Type.STRING },
+                        },
+                      },
+                      required: [
+                        'startSec',
+                        'endSec',
+                        'summary',
+                        'expressionsAndActions',
+                        'cameraAndMovement',
+                        'backgroundAndLighting',
+                        'characterIds',
+                      ],
+                    },
+                  },
+                },
+                required: ['overallStyleNotes', 'characters', 'scenes'],
+              },
             },
-          },
-        })
+          }),
+        (statusMsg) => {
+          updateJobFields(jobId, { stage_detail: statusMsg });
+        }
       );
 
       // Clean up temporary uploaded full video on File API best-effort
@@ -520,26 +592,32 @@ Preserve exact identity and visual traits strictly:
 - Distinctive features: ${char.distinctiveFeatures}
 Render with theatrical 3D anime skin subsurface scattering, sculpted hair strands, fabric textures, and crisp neutral reference lighting.`;
 
-          const refImgRes = await withRetry(`3D anime reference for ${char.name}`, () =>
-            ai.models.generateContent({
-              model: 'gemini-3.1-flash-lite-image',
-              contents: {
-                parts: [
-                  {
-                    inlineData: {
-                      mimeType: 'image/jpeg',
-                      data: sourceB64,
+          const refImgRes = await withModelFailover(
+            `3D anime reference for ${char.name}`,
+            ['gemini-3.1-flash-lite-image', 'gemini-nano-banana-2.1'],
+            (model) =>
+              ai.models.generateContent({
+                model,
+                contents: {
+                  parts: [
+                    {
+                      inlineData: {
+                        mimeType: 'image/jpeg',
+                        data: sourceB64,
+                      },
                     },
-                  },
-                  { text: refPrompt },
-                ],
-              },
-              config: {
-                imageConfig: {
-                  aspectRatio: '1:1',
+                    { text: refPrompt },
+                  ],
                 },
-              },
-            })
+                config: {
+                  imageConfig: {
+                    aspectRatio: '1:1',
+                  },
+                },
+              }),
+            (statusMsg) => {
+              updateJobFields(jobId, { stage_detail: statusMsg });
+            }
           );
 
           const parts = refImgRes.candidates?.[0]?.content?.parts ?? [];
@@ -679,33 +757,41 @@ Render with theatrical 3D anime skin subsurface scattering, sculpted hair strand
         const veoDurationSec = Math.max(3, Math.min(10, Math.round(scene.durationSec)));
 
         try {
-          const interaction = await withRetry(`Veo 3D Anime scene ${i + 1}`, () =>
-            ai.interactions.create(
-              {
-                model: 'gemini-omni-1.2-flash',
-                input: [
-                  {
+          const interaction = await withRetry(
+            `Veo 3D Anime scene ${i + 1}`,
+            () =>
+              ai.interactions.create(
+                {
+                  model: 'gemini-omni-1.2-flash',
+                  input: [
+                    {
+                      type: 'video',
+                      uri: uploadedSceneSlice.uri,
+                    },
+                    ...sceneCharRefs,
+                    {
+                      type: 'text',
+                      text: scene.conversionPrompt,
+                    },
+                  ],
+                  background: false,
+                  store: false,
+                  stream: false,
+                  response_format: {
                     type: 'video',
-                    uri: uploadedSceneSlice.uri,
+                    aspect_ratio: aspectRatio,
+                    duration: `${veoDurationSec}s`,
+                    resolution: '720p',
                   },
-                  ...sceneCharRefs,
-                  {
-                    type: 'text',
-                    text: scene.conversionPrompt,
-                  },
-                ],
-                background: false,
-                store: false,
-                stream: false,
-                response_format: {
-                  type: 'video',
-                  aspect_ratio: aspectRatio,
-                  duration: `${veoDurationSec}s`,
-                  resolution: '720p',
-                },
-              } as Parameters<typeof ai.interactions.create>[0],
-              { timeout: 300000 }
-            )
+                } as Parameters<typeof ai.interactions.create>[0],
+                { timeout: 300000 }
+              ),
+            5,
+            (attempt, maxAttempts, delayMs, reason) => {
+              updateJobFields(jobId, {
+                stage_detail: `Scene ${i + 1}/${scenes.length}: ${reason} — retrying Veo automatically (${attempt + 1}/${maxAttempts}) in ${Math.round(delayMs / 1000)}s...`,
+              });
+            }
           );
 
           // Extract generated video payload cleanly (supports both output_video helper and steps)

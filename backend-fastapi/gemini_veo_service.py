@@ -27,9 +27,9 @@ def _upload_and_wait(client: genai.Client, file_path: str, mime_type: str):
     return uploaded
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=3, max=20), reraise=True)
+@retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=4, max=25), reraise=True)
 def analyze_full_cartoon_video(video_path: str, duration_sec: float) -> Dict:
-    """Uses Gemini video understanding across the full duration (up to 60s) to extract characters and scene segments."""
+    """Uses Gemini video understanding across the full duration (up to 60s) with 503 failover."""
     client = get_genai_client()
     uploaded = _upload_and_wait(client, video_path, "video/mp4")
     try:
@@ -41,12 +41,22 @@ def analyze_full_cartoon_video(video_path: str, duration_sec: float) -> Dict:
             "(chronological array covering 0.0s to full duration in 4-9s segments with startSec, endSec, "
             "summary, expressionsAndActions, cameraAndMovement, backgroundAndLighting, characterIds)."
         )
-        response = client.models.generate_content(
-            model="gemini-4-hydrogen",
-            contents=[uploaded, prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        return json.loads((response.text or "{}").strip())
+        last_exc = None
+        for model_name in ("gemini-4-hydrogen", "gemini-4-neon", "gemini-3.1-flash-lite"):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[uploaded, prompt],
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+                return json.loads((response.text or "{}").strip())
+            except Exception as exc:
+                last_exc = exc
+                err_str = str(exc)
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    continue
+                raise
+        raise last_exc or RuntimeError("All Gemini video analysis models failed.")
     finally:
         try:
             client.files.delete(name=uploaded.name)
@@ -54,11 +64,11 @@ def analyze_full_cartoon_video(video_path: str, duration_sec: float) -> Dict:
             pass
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=3, max=20), reraise=True)
+@retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=4, max=25), reraise=True)
 def generate_3d_anime_character_reference(
     source_frame_path: str, character_profile: Dict, out_png_path: str
 ) -> bool:
-    """Creates a canonical 3D Anime character reference sheet from the source frame + structured profile."""
+    """Creates a canonical 3D Anime character reference sheet with 503 model failover."""
     client = get_genai_client()
     with open(source_frame_path, "rb") as fh:
         frame_bytes = fh.read()
@@ -72,19 +82,29 @@ def generate_3d_anime_character_reference(
         f"Distinctive traits: {character_profile['distinctiveFeatures']}."
     )
 
-    response = client.models.generate_content(
-        model="gemini-3.1-flash-lite-image",
-        contents=[
-            types.Part.from_bytes(data=frame_bytes, mime_type="image/jpeg"),
-            prompt,
-        ],
-    )
-    for part in response.candidates[0].content.parts:
-        if part.inline_data and part.inline_data.data:
-            with open(out_png_path, "wb") as out:
-                out.write(part.inline_data.data)
-            return True
-    return False
+    last_exc = None
+    for model_name in ("gemini-3.1-flash-lite-image", "gemini-nano-banana-2.1"):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=frame_bytes, mime_type="image/jpeg"),
+                    prompt,
+                ],
+            )
+            for part in response.candidates[0].content.parts:
+                if part.inline_data and part.inline_data.data:
+                    with open(out_png_path, "wb") as out:
+                        out.write(part.inline_data.data)
+                    return True
+            return False
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc)
+            if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                continue
+            raise
+    raise last_exc or RuntimeError("Failed to generate 3D anime character reference portrait.")
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=3, min=4, max=25), reraise=True)
