@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   CheckCircle2,
   Circle,
+  Layers,
   Loader2,
   Play,
   RefreshCw,
@@ -10,13 +11,19 @@ import {
   XCircle,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { ConversionJob, PIPELINE_STAGES, formatDuration, formatTimeShort } from '../types';
+import {
+  ConversionJob,
+  PIPELINE_STAGES,
+  buildMediaUrl,
+  formatDuration,
+  formatTimeShort,
+} from '../types';
 
 interface ProcessingScreenProps {
   job: ConversionJob;
   onBackHome: () => void;
   onOpenResult: () => void;
-  onResumeJob: (jobId: string) => Promise<void>;
+  onResumeJob: (jobId: string) => Promise<string | null>;
 }
 
 export function ProcessingScreen({
@@ -26,7 +33,10 @@ export function ProcessingScreen({
   onResumeJob,
 }: ProcessingScreenProps) {
   const [isResuming, setIsResuming] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
+
+  const isNanoBananaFrames = job.conversionMode === 'nano_banana_frames';
 
   useEffect(() => {
     const startMs = new Date(job.createdAt).getTime();
@@ -45,12 +55,32 @@ export function ProcessingScreen({
 
   const handleResume = async () => {
     setIsResuming(true);
+    setResumeError(null);
     try {
-      await onResumeJob(job.jobId);
+      const err = await onResumeJob(job.jobId);
+      if (err) {
+        setResumeError(err);
+      }
     } finally {
       setIsResuming(false);
     }
   };
+
+  const getStageLabel = (stageId: number, fallback: string): string => {
+    if (stageId === 7) {
+      return isNanoBananaFrames
+        ? 'Nano Banana generating 3D frames'
+        : 'Veo generating 3D scenes';
+    }
+    if (stageId === 8) {
+      return isNanoBananaFrames
+        ? 'Stitching 3D frame sequence'
+        : 'Combining generated scenes';
+    }
+    return fallback;
+  };
+
+  const completedFramesCount = job.frames.filter((f) => f.status === 'completed').length;
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 pt-6 pb-24 md:pb-12">
@@ -70,8 +100,15 @@ export function ProcessingScreen({
               Converting to {job.visualStyleLabel}
             </h1>
             <p className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums truncate">
-              {job.originalFilename} · {job.visualStyleLabel} · {formatDuration(job.metadata.durationSec)} ·{' '}
-              {job.metadata.width}x{job.metadata.height} ({job.metadata.orientation})
+              {job.originalFilename} ·{' '}
+              <span className="font-sans">
+                {isNanoBananaFrames ? 'Nano Banana Frame-by-Frame' : 'Veo Scene Synthesis'}
+              </span>{' '}
+              · {formatDuration(job.metadata.durationSec)} · {job.metadata.width}x
+              {job.metadata.height} ({job.metadata.orientation})
+              {job.nanoBananaImagesUsed > 0
+                ? ` · ${job.nanoBananaImagesUsed} Nano Banana images used`
+                : ''}
             </p>
           </div>
         </div>
@@ -135,14 +172,25 @@ export function ProcessingScreen({
             className="mt-5 rounded-xl border border-red-300 dark:border-red-500/30 bg-red-50 dark:bg-red-500/10 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
           >
             <div className="flex items-start gap-3">
-              <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-400 shrink-0 mt-0.5" aria-hidden="true" />
+              <AlertTriangle
+                className="w-5 h-5 text-red-600 dark:text-red-400 shrink-0 mt-0.5"
+                aria-hidden="true"
+              />
               <div className="text-sm text-red-800 dark:text-red-200">
                 <p className="font-semibold">Processing paused with an error</p>
                 <p className="mt-0.5">{job.errorMessage}</p>
                 <p className="mt-1 text-xs text-red-700/80 dark:text-red-300/80">
                   Last completed checkpoint: Stage {job.lastCompletedStage} of 10. Resuming keeps
-                  all extracted frames, character profiles, and completed Veo scenes.
+                  all extracted frames, character profiles, and{' '}
+                  {isNanoBananaFrames
+                    ? `${completedFramesCount} completed Nano Banana 3D frame(s).`
+                    : 'all completed Veo scenes.'}
                 </p>
+                {resumeError && (
+                  <p className="mt-1.5 text-xs font-semibold text-red-700 dark:text-red-300">
+                    {resumeError}
+                  </p>
+                )}
               </div>
             </div>
 
@@ -165,7 +213,7 @@ export function ProcessingScreen({
         )}
       </section>
 
-      {/* Main Grid: 10-Stage Checklist + Live Character & Scene Proof-of-Work */}
+      {/* Main Grid: 10-Stage Checklist + Live Character, Frame & Scene Proof-of-Work */}
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         {/* Left: All 10 Pipeline Stages */}
         <section className="lg:col-span-5 bg-white dark:bg-[#131720] border border-zinc-200/90 dark:border-white/8 rounded-2xl p-5">
@@ -222,11 +270,11 @@ export function ProcessingScreen({
                             : 'text-zinc-500 dark:text-zinc-500'
                       }`}
                     >
-                      {stage.id}. {stage.label}
+                      {stage.id}. {getStageLabel(stage.id, stage.label)}
                     </span>
                   </div>
                   <span className="text-xs font-mono text-zinc-500 dark:text-zinc-400 shrink-0">
-                    {isCompleted ? 'Done' : isFailedHere ? 'Error' : isCurrent ? 'Active' : 'Queued'}
+                    {isCompleted ? 'Done' : isFailedHere ? 'Paused' : isCurrent ? 'Active' : 'Queued'}
                   </span>
                 </li>
               );
@@ -234,8 +282,122 @@ export function ProcessingScreen({
           </ol>
         </section>
 
-        {/* Right: Character Consistency Registry + Scene Timeline */}
+        {/* Right: Character Consistency Registry + Nano Banana Frames + Scene Timeline */}
         <div className="lg:col-span-7 space-y-6">
+          {/* Live Nano Banana Frame-by-Frame Queue */}
+          {isNanoBananaFrames && (
+            <section className="bg-white dark:bg-[#131720] border border-zinc-200/90 dark:border-white/8 rounded-2xl p-5">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+                <div className="flex items-center gap-2">
+                  <Layers className="w-4 h-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+                  <h3 className="font-display text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                    Nano Banana Frame-by-Frame Render Queue
+                  </h3>
+                </div>
+                <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
+                  {completedFramesCount} / {job.frames.length} frames · {job.targetFps} FPS
+                </span>
+              </div>
+
+              {job.frames.length === 0 ? (
+                <p className="text-sm text-zinc-500 dark:text-zinc-400 py-4">
+                  Sequential 2D frames will appear here once Stage 2 finishes extracting frames
+                  within your daily Nano Banana limit.
+                </p>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[420px] overflow-y-auto pr-1">
+                  {job.frames.map((frame) => {
+                    const srcUrl = buildMediaUrl(
+                      `/api/jobs/${job.jobId}/assets/${frame.sourceAsset}`,
+                      job.mediaToken
+                    );
+                    const renderedUrl = frame.renderedAsset
+                      ? buildMediaUrl(
+                          `/api/jobs/${job.jobId}/assets/${frame.renderedAsset}`,
+                          job.mediaToken
+                        )
+                      : null;
+
+                    return (
+                      <div
+                        key={frame.frameIndex}
+                        className="p-3 rounded-xl bg-zinc-50 dark:bg-[#0E1118] border border-zinc-200/80 dark:border-white/6 space-y-2"
+                      >
+                        <div className="flex items-center justify-between gap-2 text-xs">
+                          <span className="font-mono tabular-nums text-zinc-600 dark:text-zinc-300 font-medium">
+                            Frame #{frame.frameIndex + 1} · {formatTimeShort(frame.timestampSec)}
+                          </span>
+                          <span
+                            className={`font-medium ${
+                              frame.status === 'completed'
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : frame.status === 'generating'
+                                  ? 'text-blue-600 dark:text-blue-400'
+                                  : frame.status === 'failed'
+                                    ? 'text-red-600 dark:text-red-400'
+                                    : 'text-zinc-500'
+                            }`}
+                          >
+                            {frame.status === 'completed'
+                              ? '3D Rendered'
+                              : frame.status === 'generating'
+                                ? 'Nano Banana...'
+                                : frame.status === 'failed'
+                                  ? 'Paused'
+                                  : 'Queued'}
+                          </span>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="relative aspect-video rounded-lg overflow-hidden bg-zinc-900 border border-zinc-200 dark:border-white/10">
+                            <img
+                              src={srcUrl}
+                              alt={`Frame ${frame.frameIndex + 1} 2D source`}
+                              referrerPolicy="no-referrer"
+                              className="w-full h-full object-cover"
+                            />
+                            <span className="absolute bottom-1 left-1 px-1.5 py-0.5 rounded bg-black/70 text-[10px] font-medium text-white">
+                              2D
+                            </span>
+                          </div>
+
+                          <div className="relative aspect-video rounded-lg overflow-hidden bg-zinc-900 border border-zinc-200 dark:border-white/10 flex items-center justify-center">
+                            {renderedUrl ? (
+                              <>
+                                <img
+                                  src={renderedUrl}
+                                  alt={`Frame ${frame.frameIndex + 1} 3D Nano Banana output`}
+                                  referrerPolicy="no-referrer"
+                                  className="w-full h-full object-cover"
+                                />
+                                <span className="absolute bottom-1 left-1 px-1.5 py-0.5 rounded bg-blue-600/90 text-[10px] font-medium text-white">
+                                  3D
+                                </span>
+                              </>
+                            ) : frame.status === 'generating' ? (
+                              <Loader2
+                                className="w-4 h-4 text-blue-400 animate-spin"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <span className="text-[11px] text-zinc-500 font-mono">Waiting</span>
+                            )}
+                          </div>
+                        </div>
+
+                        {frame.errorMessage && (
+                          <p className="text-[11px] text-red-600 dark:text-red-400 line-clamp-2">
+                            {frame.errorMessage}
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          )}
+
           {/* Character Consistency Engine */}
           <section className="bg-white dark:bg-[#131720] border border-zinc-200/90 dark:border-white/8 rounded-2xl p-5">
             <div className="flex items-center justify-between gap-2 mb-4">
@@ -252,8 +414,8 @@ export function ProcessingScreen({
 
             {job.characters.length === 0 ? (
               <p className="text-sm text-zinc-500 dark:text-zinc-400 py-4">
-                Waiting for Gemini full-video analysis to identify characters and generate locked 3D
-                Anime reference sheets...
+                Waiting for Gemini full-video analysis to identify characters and lock consistent
+                3D reference profiles...
               </p>
             ) : (
               <div className="space-y-4">
@@ -266,7 +428,10 @@ export function ProcessingScreen({
                       {char.sourceFaceAsset && (
                         <div className="w-20 h-20 rounded-lg overflow-hidden bg-zinc-200 dark:bg-zinc-900 border border-zinc-200 dark:border-white/10">
                           <img
-                            src={`/api/jobs/${job.jobId}/assets/${char.sourceFaceAsset}`}
+                            src={buildMediaUrl(
+                              `/api/jobs/${job.jobId}/assets/${char.sourceFaceAsset}`,
+                              job.mediaToken
+                            )}
                             alt={`${char.name} 2D source frame`}
                             referrerPolicy="no-referrer"
                             className="w-full h-full object-cover"
@@ -276,8 +441,11 @@ export function ProcessingScreen({
                       {char.animeRefAsset && (
                         <div className="w-20 h-20 rounded-lg overflow-hidden bg-zinc-200 dark:bg-zinc-900 border border-blue-500/40">
                           <img
-                            src={`/api/jobs/${job.jobId}/assets/${char.animeRefAsset}`}
-                            alt={`${char.name} 3D Anime reference portrait`}
+                            src={buildMediaUrl(
+                              `/api/jobs/${job.jobId}/assets/${char.animeRefAsset}`,
+                              job.mediaToken
+                            )}
+                            alt={`${char.name} 3D reference portrait`}
                             referrerPolicy="no-referrer"
                             className="w-full h-full object-cover"
                           />
@@ -327,15 +495,16 @@ export function ProcessingScreen({
             )}
           </section>
 
-          {/* Scene-by-Scene Veo Generation Breakdown */}
+          {/* Scene Breakdown */}
           <section className="bg-white dark:bg-[#131720] border border-zinc-200/90 dark:border-white/8 rounded-2xl p-5">
             <div className="flex items-center justify-between gap-2 mb-4">
               <h3 className="font-display text-base font-semibold text-zinc-900 dark:text-zinc-50">
-                Scene-by-Scene Veo Queue
+                {isNanoBananaFrames ? 'Detected Scene Context' : 'Scene-by-Scene Veo Queue'}
               </h3>
               <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
-                {job.scenes.filter((s) => s.status === 'completed').length} / {job.scenes.length}{' '}
-                scenes
+                {isNanoBananaFrames
+                  ? `${job.scenes.length} scene${job.scenes.length === 1 ? '' : 's'} analyzed`
+                  : `${job.scenes.filter((s) => s.status === 'completed').length} / ${job.scenes.length} scenes`}
               </span>
             </div>
 
@@ -353,7 +522,10 @@ export function ProcessingScreen({
                     {scene.keyframeAsset && (
                       <div className="w-20 aspect-video rounded-lg overflow-hidden bg-zinc-900 shrink-0 border border-zinc-200 dark:border-white/10">
                         <img
-                          src={`/api/jobs/${job.jobId}/assets/${scene.keyframeAsset}`}
+                          src={buildMediaUrl(
+                            `/api/jobs/${job.jobId}/assets/${scene.keyframeAsset}`,
+                            job.mediaToken
+                          )}
                           alt={`Scene ${scene.sceneIndex + 1} starting keyframe`}
                           referrerPolicy="no-referrer"
                           className="w-full h-full object-cover"
@@ -366,25 +538,27 @@ export function ProcessingScreen({
                           Scene {scene.sceneIndex + 1} · {formatTimeShort(scene.startSec)} –{' '}
                           {formatTimeShort(scene.endSec)}
                         </p>
-                        <span
-                          className={`text-xs font-medium ${
-                            scene.status === 'completed'
-                              ? 'text-emerald-600 dark:text-emerald-400'
+                        {!isNanoBananaFrames && (
+                          <span
+                            className={`text-xs font-medium ${
+                              scene.status === 'completed'
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : scene.status === 'generating'
+                                  ? 'text-blue-600 dark:text-blue-400'
+                                  : scene.status === 'failed'
+                                    ? 'text-red-600 dark:text-red-400'
+                                    : 'text-zinc-500'
+                            }`}
+                          >
+                            {scene.status === 'completed'
+                              ? 'Rendered'
                               : scene.status === 'generating'
-                                ? 'text-blue-600 dark:text-blue-400'
+                                ? 'Veo Generating...'
                                 : scene.status === 'failed'
-                                  ? 'text-red-600 dark:text-red-400'
-                                  : 'text-zinc-500'
-                          }`}
-                        >
-                          {scene.status === 'completed'
-                            ? 'Rendered'
-                            : scene.status === 'generating'
-                              ? 'Veo Generating...'
-                              : scene.status === 'failed'
-                                ? 'Failed'
-                                : 'Pending'}
-                        </span>
+                                  ? 'Failed'
+                                  : 'Pending'}
+                          </span>
+                        )}
                       </div>
                       <p className="mt-1 text-sm text-zinc-900 dark:text-zinc-100">
                         {scene.summary}

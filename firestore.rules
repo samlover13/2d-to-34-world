@@ -1,0 +1,205 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1 / Global Safety Net: default-deny all unspecified paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global hardened helper primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidDateKey(dateKey) {
+      return dateKey is string && dateKey.size() == 10 && dateKey.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidStyleId(styleId) {
+      return styleId in [
+        'pixar_3d',
+        'stylized_3d',
+        'cel_shaded_npr',
+        'low_poly',
+        'chibi_sd',
+        'stop_motion_clay'
+      ];
+    }
+
+    function isValidMode(mode) {
+      return mode in ['nano_banana_frames', 'veo_scenes'];
+    }
+
+    // Pillar 2: Validation Blueprint for UserProfile (used on create & update)
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll([
+          'uid',
+          'displayName',
+          'email',
+          'photoUrl',
+          'preferredStyle',
+          'preferredMode',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid',
+          'displayName',
+          'email',
+          'photoUrl',
+          'preferredStyle',
+          'preferredMode',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.uid)
+        && data.uid == request.auth.uid
+        && data.uid == userId
+        && data.displayName is string
+        && data.displayName.size() <= 120
+        && data.email is string
+        && data.email.size() <= 200
+        && data.photoUrl is string
+        && data.photoUrl.size() <= 500
+        && data.preferredStyle is string
+        && data.preferredStyle.size() <= 32
+        && isValidStyleId(data.preferredStyle)
+        && data.preferredMode is string
+        && data.preferredMode.size() <= 32
+        && isValidMode(data.preferredMode)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Pillar 2: Validation Blueprint for DailyNanoBananaQuota (used on create & update)
+    function isValidDailyQuota(data, userId, dateKey) {
+      return data.keys().hasAll([
+          'uid',
+          'dateKey',
+          'dailyLimit',
+          'imagesUsed',
+          'lastJobId',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid',
+          'dateKey',
+          'dailyLimit',
+          'imagesUsed',
+          'lastJobId',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.uid)
+        && data.uid == request.auth.uid
+        && data.uid == userId
+        && isValidDateKey(data.dateKey)
+        && data.dateKey == dateKey
+        && data.dailyLimit is int
+        && data.dailyLimit >= 1
+        && data.dailyLimit <= 500
+        && data.imagesUsed is int
+        && data.imagesUsed >= 0
+        && data.imagesUsed <= data.dailyLimit
+        && data.lastJobId is string
+        && data.lastJobId.size() <= 64
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Owner-isolated user profiles (PII Isolation: no list, owner-only get)
+    match /users/{userId} {
+      allow get: if isVerifiedOwner(userId) && isValidId(userId);
+      allow list: if false;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isValidUserProfile(incoming(), userId)
+        && isVerifiedOwner(userId)
+        && isValidId(userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Update studio preferences & profile details
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName',
+            'email',
+            'photoUrl',
+            'preferredStyle',
+            'preferredMode',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if false;
+
+      // Subcollection: Daily Nano Banana Quota (Master Gate requires parent user doc)
+      match /quotas/{dateKey} {
+        allow get: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidDateKey(dateKey)
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow list: if isVerifiedOwner(userId)
+          && resource.data.uid == request.auth.uid;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidDateKey(dateKey)
+          && isValidDailyQuota(incoming(), userId, dateKey)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isValidDailyQuota(incoming(), userId, dateKey)
+          && isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidDateKey(dateKey)
+          && incoming().uid == existing().uid
+          && incoming().dateKey == existing().dateKey
+          && incoming().dailyLimit == existing().dailyLimit
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().imagesUsed >= existing().imagesUsed
+          && (
+            // Action: Sync monotonically increasing Nano Banana usage count
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'imagesUsed',
+              'lastJobId',
+              'updatedAt'
+            ])
+          )
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow delete: if false;
+      }
+    }
+  }
+}

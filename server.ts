@@ -7,18 +7,32 @@ import multer from 'multer';
 import path from 'path';
 import { promisify } from 'util';
 import { createServer as createViteServer } from 'vite';
-
-const execFileAsync = promisify(execFile);
 import {
+  AuthenticatedRequest,
+  createMediaToken,
+  requireGoogleAuth,
+  verifyBearerHeader,
+  verifyMediaToken,
+} from './server/auth.ts';
+import {
+  NANO_BANANA_DAILY_LIMIT,
   createJobRecord,
   getJobResponse,
   getRawJob,
-  listRecentJobs,
+  getUserDailyQuota,
+  listRecentJobsForUser,
   markInterruptedJobsResumable,
 } from './server/db.ts';
 import { generateSample2DCartoonVideo, probeVideo } from './server/ffmpeg.ts';
 import { enqueueJobPipeline, isJobRunning } from './server/geminiPipeline.ts';
-import { VISUAL_STYLES, resolveVisualStyle } from './server/types.ts';
+import {
+  JobResponse,
+  VISUAL_STYLES,
+  resolveConversionMode,
+  resolveVisualStyle,
+} from './server/types.ts';
+
+const execFileAsync = promisify(execFile);
 
 dotenv.config();
 
@@ -60,6 +74,37 @@ function isPathInside(baseDir: string, targetPath: string): boolean {
   return resolvedTarget.startsWith(resolvedBase + path.sep);
 }
 
+function attachMediaToken(job: JobResponse, uid: string): JobResponse {
+  return {
+    ...job,
+    mediaToken: createMediaToken(job.jobId, uid),
+  };
+}
+
+function isJobOwnedByUser(jobUserId: string | null, uid: string): boolean {
+  // Legacy jobs created prior to Google Login remain accessible; new jobs strictly require owner UID match
+  return jobUserId === null || jobUserId === uid;
+}
+
+async function authorizeMediaRequest(
+  req: express.Request,
+  jobId: string,
+  jobUserId: string | null
+): Promise<boolean> {
+  const bearerUser = await verifyBearerHeader(req.headers.authorization);
+  if (bearerUser && isJobOwnedByUser(jobUserId, bearerUser.uid)) {
+    return true;
+  }
+  const tokenParam = typeof req.query.token === 'string' ? req.query.token : '';
+  if (tokenParam) {
+    const verified = verifyMediaToken(tokenParam, jobId);
+    if (verified && isJobOwnedByUser(jobUserId, verified.uid)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function collectDeliverableFiles(): Array<{ path: string; group: string; sizeBytes: number }> {
   const roots = [
     { dir: 'android-app', group: 'Native Android (Kotlin / Jetpack Compose)' },
@@ -99,7 +144,7 @@ async function startServer(): Promise<void> {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
-  // Health & config info (never exposes API keys)
+  // Health & public config info (never exposes API keys)
   app.get('/api/health', (_req, res) => {
     const keyConfigured =
       Boolean(process.env.GEMINI_API_KEY) && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY';
@@ -108,6 +153,8 @@ async function startServer(): Promise<void> {
       maxDurationSec: 60,
       supportedFormats: ['MP4', 'MOV'],
       geminiConfigured: keyConfigured,
+      authRequired: true,
+      nanoBananaDailyLimit: NANO_BANANA_DAILY_LIMIT,
       visualStyles: VISUAL_STYLES.map(({ id, name, description }) => ({
         id,
         name,
@@ -116,13 +163,30 @@ async function startServer(): Promise<void> {
     });
   });
 
-  // List recent conversion jobs
-  app.get('/api/jobs', (_req, res) => {
-    res.json({ jobs: listRecentJobs(25) });
+  // Get signed-in Google user's live Nano Banana daily image quota
+  app.get('/api/quota', requireGoogleAuth, (req: AuthenticatedRequest, res) => {
+    const user = req.authUser!;
+    res.json({
+      user: {
+        uid: user.uid,
+        email: user.email,
+        name: user.name,
+        picture: user.picture,
+      },
+      quota: getUserDailyQuota(user.uid),
+    });
   });
 
-  // Upload 2D cartoon video and create a conversion job
-  app.post('/api/jobs', (req, res) => {
+  // List recent conversion jobs owned by the signed-in Google user
+  app.get('/api/jobs', requireGoogleAuth, (req: AuthenticatedRequest, res) => {
+    const uid = req.authUser!.uid;
+    const jobs = listRecentJobsForUser(uid, 25).map((j) => attachMediaToken(j, uid));
+    res.json({ jobs, quota: getUserDailyQuota(uid) });
+  });
+
+  // Upload 2D cartoon video and create a conversion job (requires Google Login)
+  app.post('/api/jobs', requireGoogleAuth, (req: AuthenticatedRequest, res) => {
+    const authUser = req.authUser!;
     upload.single('video')(req, res, async (uploadErr) => {
       if (uploadErr) {
         const message =
@@ -164,6 +228,38 @@ async function startServer(): Promise<void> {
               : undefined;
         const resolvedStyle = resolveVisualStyle(requestedStyle);
 
+        const requestedMode =
+          typeof req.body?.conversion_mode === 'string'
+            ? req.body.conversion_mode
+            : typeof req.body?.conversionMode === 'string'
+              ? req.body.conversionMode
+              : undefined;
+        const conversionMode = resolveConversionMode(requestedMode);
+
+        const quota = getUserDailyQuota(authUser.uid);
+        if (conversionMode === 'nano_banana_frames' && quota.imagesRemaining < 2) {
+          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+          res.status(429).json({
+            error: `Daily Nano Banana image limit reached (${quota.imagesUsed}/${quota.dailyLimit}). Quota resets at ${quota.resetAtUtc}.`,
+            quota,
+          });
+          return;
+        }
+
+        const rawFps = req.body?.target_fps ?? req.body?.targetFps;
+        let targetFps = 2;
+        if (rawFps === 'auto' || rawFps === undefined || rawFps === '') {
+          // Automatically fit frame density within the user's remaining Nano Banana daily limit
+          const fitBudget = Math.max(2, Math.min(36, quota.imagesRemaining - 2));
+          const computed = fitBudget / Math.max(1, metadata.durationSec);
+          targetFps = Math.max(0.5, Math.min(4, Math.round(computed * 2) / 2));
+        } else {
+          const parsedFps = Number(rawFps);
+          if (Number.isFinite(parsedFps)) {
+            targetFps = Math.max(0.5, Math.min(4, parsedFps));
+          }
+        }
+
         const jobId = crypto.randomUUID();
         const jobDir = path.join(JOBS_BASE_DIR, jobId);
         fs.mkdirSync(jobDir, { recursive: true });
@@ -172,8 +268,11 @@ async function startServer(): Promise<void> {
 
         createJobRecord({
           jobId,
+          userId: authUser.uid,
           originalFilename: originalName,
           visualStyle: resolvedStyle.id,
+          conversionMode,
+          targetFps,
           inputPath: persistedInputPath,
           metadata,
         });
@@ -183,7 +282,8 @@ async function startServer(): Promise<void> {
         const job = getJobResponse(jobId);
         res.status(201).json({
           job_id: jobId,
-          job,
+          job: job ? attachMediaToken(job, authUser.uid) : null,
+          quota: getUserDailyQuota(authUser.uid),
         });
       } catch (err) {
         if (fs.existsSync(tempPath)) {
@@ -235,9 +335,10 @@ async function startServer(): Promise<void> {
     res.sendFile(sampleVideoPath);
   });
 
-  // Get real-time job status, progress, character profiles, and scene timeline
-  app.get('/api/jobs/:jobId', (req, res) => {
+  // Get real-time job status, progress, character profiles, frames, and scene timeline
+  app.get('/api/jobs/:jobId', requireGoogleAuth, (req: AuthenticatedRequest, res) => {
     const { jobId } = req.params;
+    const uid = req.authUser!.uid;
     if (!UUID_REGEX.test(jobId)) {
       res.status(400).json({ error: 'Invalid job ID format.' });
       return;
@@ -247,12 +348,20 @@ async function startServer(): Promise<void> {
       res.status(404).json({ error: 'Conversion job not found.' });
       return;
     }
-    res.json(job);
+    if (!isJobOwnedByUser(job.userId, uid)) {
+      res.status(403).json({ error: 'Access denied to this conversion job.' });
+      return;
+    }
+    res.json({
+      ...attachMediaToken(job, uid),
+      quota: getUserDailyQuota(uid),
+    });
   });
 
-  // Resume a failed job from its last completed stage/scene checkpoint
-  app.post('/api/jobs/:jobId/resume', (req, res) => {
+  // Resume a failed job from its last completed stage/frame/scene checkpoint
+  app.post('/api/jobs/:jobId/resume', requireGoogleAuth, (req: AuthenticatedRequest, res) => {
     const { jobId } = req.params;
+    const uid = req.authUser!.uid;
     if (!UUID_REGEX.test(jobId)) {
       res.status(400).json({ error: 'Invalid job ID format.' });
       return;
@@ -262,12 +371,24 @@ async function startServer(): Promise<void> {
       res.status(404).json({ error: 'Conversion job not found.' });
       return;
     }
+    if (!isJobOwnedByUser(raw.user_id, uid)) {
+      res.status(403).json({ error: 'Access denied to this conversion job.' });
+      return;
+    }
     if (raw.status === 'completed') {
-      res.json({ job: getJobResponse(jobId), message: 'Job is already completed.' });
+      const doneJob = getJobResponse(jobId);
+      res.json({
+        job: doneJob ? attachMediaToken(doneJob, uid) : null,
+        message: 'Job is already completed.',
+      });
       return;
     }
     if (isJobRunning(jobId)) {
-      res.json({ job: getJobResponse(jobId), message: 'Job is currently processing.' });
+      const runningJob = getJobResponse(jobId);
+      res.json({
+        job: runningJob ? attachMediaToken(runningJob, uid) : null,
+        message: 'Job is currently processing.',
+      });
       return;
     }
     if (!fs.existsSync(raw.input_path)) {
@@ -276,11 +397,16 @@ async function startServer(): Promise<void> {
     }
 
     enqueueJobPipeline(jobId);
-    res.json({ job: getJobResponse(jobId), resumedFromStage: raw.last_completed_stage + 1 });
+    const updatedJob = getJobResponse(jobId);
+    res.json({
+      job: updatedJob ? attachMediaToken(updatedJob, uid) : null,
+      resumedFromStage: raw.last_completed_stage + 1,
+      quota: getUserDailyQuota(uid),
+    });
   });
 
-  // Download or stream converted 3D Anime MP4
-  app.get('/api/jobs/:jobId/download', (req, res) => {
+  // Download or stream converted 3D MP4 (accepts Bearer ID token or signed job mediaToken)
+  app.get('/api/jobs/:jobId/download', async (req, res) => {
     const { jobId } = req.params;
     if (!UUID_REGEX.test(jobId)) {
       res.status(400).json({ error: 'Invalid job ID format.' });
@@ -288,7 +414,11 @@ async function startServer(): Promise<void> {
     }
     const raw = getRawJob(jobId);
     if (!raw || !raw.output_path || !fs.existsSync(raw.output_path)) {
-      res.status(404).json({ error: 'Converted 3D Anime video is not ready yet.' });
+      res.status(404).json({ error: 'Converted 3D video is not ready yet.' });
+      return;
+    }
+    if (!(await authorizeMediaRequest(req, jobId, raw.user_id))) {
+      res.status(401).json({ error: 'Sign in with Google to access this video.' });
       return;
     }
     if (!isPathInside(JOBS_BASE_DIR, raw.output_path)) {
@@ -307,7 +437,7 @@ async function startServer(): Promise<void> {
   });
 
   // Stream original uploaded 2D cartoon video for side-by-side comparison
-  app.get('/api/jobs/:jobId/original', (req, res) => {
+  app.get('/api/jobs/:jobId/original', async (req, res) => {
     const { jobId } = req.params;
     if (!UUID_REGEX.test(jobId)) {
       res.status(400).json({ error: 'Invalid job ID format.' });
@@ -318,16 +448,29 @@ async function startServer(): Promise<void> {
       res.status(404).json({ error: 'Original video not found.' });
       return;
     }
+    if (!(await authorizeMediaRequest(req, jobId, raw.user_id))) {
+      res.status(401).json({ error: 'Sign in with Google to access this video.' });
+      return;
+    }
     const ext = path.extname(raw.input_path).toLowerCase();
     res.setHeader('Content-Type', ext === '.mov' ? 'video/quicktime' : 'video/mp4');
     res.sendFile(raw.input_path);
   });
 
-  // Serve extracted character reference portraits and scene keyframes
-  app.get('/api/jobs/:jobId/assets/:assetName', (req, res) => {
+  // Serve extracted character reference portraits, source frames, and rendered Nano Banana 3D frames
+  app.get('/api/jobs/:jobId/assets/:assetName', async (req, res) => {
     const { jobId, assetName } = req.params;
     if (!UUID_REGEX.test(jobId) || !ASSET_NAME_REGEX.test(assetName)) {
       res.status(400).json({ error: 'Invalid asset path.' });
+      return;
+    }
+    const raw = getRawJob(jobId);
+    if (!raw) {
+      res.status(404).json({ error: 'Job not found.' });
+      return;
+    }
+    if (!(await authorizeMediaRequest(req, jobId, raw.user_id))) {
+      res.status(401).json({ error: 'Sign in with Google to access job assets.' });
       return;
     }
     const jobAssetsDir = path.join(JOBS_BASE_DIR, jobId, 'assets');

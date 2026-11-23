@@ -5,11 +5,13 @@ export const PIPELINE_STAGES = [
   { id: 4, key: 'detecting_characters', label: 'Detecting characters' },
   { id: 5, key: 'character_profiles', label: 'Creating character reference profiles' },
   { id: 6, key: 'detecting_scenes', label: 'Detecting scenes and movements' },
-  { id: 7, key: 'veo_generating', label: 'Veo generating 3D Anime scenes' },
-  { id: 8, key: 'combining_scenes', label: 'Combining generated scenes' },
+  { id: 7, key: 'veo_generating', label: 'Generating 3D frames / scenes' },
+  { id: 8, key: 'combining_scenes', label: 'Combining generated output' },
   { id: 9, key: 'syncing_audio', label: 'Synchronizing original audio' },
   { id: 10, key: 'rendering_mp4', label: 'Rendering final MP4' },
 ] as const;
+
+export type ConversionMode = 'nano_banana_frames' | 'veo_scenes';
 
 export type VisualStyleId =
   | 'pixar_3d'
@@ -73,6 +75,7 @@ export const VISUAL_STYLE_OPTIONS: readonly VisualStyleOption[] = [
 
 export type JobStatus = 'queued' | 'processing' | 'completed' | 'failed';
 export type SceneStatus = 'pending' | 'generating' | 'completed' | 'failed';
+export type FrameStatus = 'pending' | 'generating' | 'completed' | 'failed';
 export type AppScreen = 'home' | 'processing' | 'result' | 'history' | 'deliverables';
 
 export interface VideoMetadata {
@@ -119,11 +122,34 @@ export interface SceneSegment {
   durationMs?: number;
 }
 
+export interface FrameItem {
+  frameIndex: number;
+  timestampSec: number;
+  sourceAsset: string;
+  renderedAsset?: string;
+  status: FrameStatus;
+  errorMessage?: string;
+  durationMs?: number;
+}
+
+export interface NanoBananaQuota {
+  dateKey: string;
+  dailyLimit: number;
+  imagesUsed: number;
+  imagesRemaining: number;
+  modelName: string;
+  resetAtUtc: string;
+}
+
 export interface ConversionJob {
   jobId: string;
+  userId: string | null;
   originalFilename: string;
   visualStyle: VisualStyleId;
   visualStyleLabel: string;
+  conversionMode: ConversionMode;
+  targetFps: number;
+  nanoBananaImagesUsed: number;
   status: JobStatus;
   progress: number;
   currentStage: number;
@@ -136,10 +162,18 @@ export interface ConversionJob {
   metadata: VideoMetadata;
   characters: CharacterProfile[];
   scenes: SceneSegment[];
+  frames: FrameItem[];
   hasOutputVideo: boolean;
   outputMetadata: VideoMetadata | null;
+  mediaToken?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export function buildMediaUrl(pathUrl: string, mediaToken?: string): string {
+  if (!mediaToken) return pathUrl;
+  const sep = pathUrl.includes('?') ? '&' : '?';
+  return `${pathUrl}${sep}token=${encodeURIComponent(mediaToken)}`;
 }
 
 export function formatBytes(bytes: number): string {

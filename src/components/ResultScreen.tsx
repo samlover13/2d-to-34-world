@@ -13,7 +13,7 @@ import {
   VolumeX,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { ConversionJob, formatBytes, formatDuration } from '../types';
+import { ConversionJob, buildMediaUrl, formatBytes, formatDuration } from '../types';
 
 interface ResultScreenProps {
   job: ConversionJob;
@@ -33,9 +33,20 @@ export function ResultScreen({ job, onConvertAnother }: ResultScreenProps) {
   const originalRef = useRef<HTMLVideoElement | null>(null);
   const convertedRef = useRef<HTMLVideoElement | null>(null);
 
-  const convertedStreamUrl = `/api/jobs/${job.jobId}/download?inline=1`;
-  const convertedDownloadUrl = `/api/jobs/${job.jobId}/download`;
-  const originalStreamUrl = `/api/jobs/${job.jobId}/original`;
+  const convertedStreamUrl = buildMediaUrl(
+    `/api/jobs/${job.jobId}/download?inline=1`,
+    job.mediaToken
+  );
+  const convertedDownloadUrl = buildMediaUrl(
+    `/api/jobs/${job.jobId}/download`,
+    job.mediaToken
+  );
+  const originalStreamUrl = buildMediaUrl(
+    `/api/jobs/${job.jobId}/original`,
+    job.mediaToken
+  );
+
+  const isNanoBananaFrames = job.conversionMode === 'nano_banana_frames';
 
   useEffect(() => {
     setIsPlaying(false);
@@ -92,7 +103,7 @@ export function ResultScreen({ job, onConvertAnother }: ResultScreenProps) {
   const triggerDownload = (label: string) => {
     const link = document.createElement('a');
     link.href = convertedDownloadUrl;
-    link.download = `${job.originalFilename.replace(/\.[^.]+$/, '')}_3d_anime.mp4`;
+    link.download = `${job.originalFilename.replace(/\.[^.]+$/, '')}_3d.mp4`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -104,8 +115,8 @@ export function ResultScreen({ job, onConvertAnother }: ResultScreenProps) {
     if (navigator.share) {
       try {
         await navigator.share({
-          title: 'Cartoon AI Studio — 3D Anime Conversion',
-          text: `Watch ${job.originalFilename} converted to 3D Anime.`,
+          title: `Cartoon AI Studio — ${job.visualStyleLabel}`,
+          text: `Watch ${job.originalFilename} converted to ${job.visualStyleLabel}.`,
           url: shareUrl,
         });
         showToast('Shared video link.');
@@ -136,17 +147,23 @@ export function ResultScreen({ job, onConvertAnother }: ResultScreenProps) {
             {job.visualStyleLabel} Video Ready
           </h1>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
+            <span className="font-sans">
+              {isNanoBananaFrames
+                ? `Nano Banana Frame-by-Frame (${job.frames.length} frames)`
+                : `Veo Scene-by-Scene (${job.scenes.length} scenes)`}
+            </span>
+            <span aria-hidden="true">·</span>
             <span className="font-sans">{job.visualStyleLabel}</span>
             <span aria-hidden="true">·</span>
-            <span>{outMeta.width}x{outMeta.height}</span>
+            <span>
+              {outMeta.width}x{outMeta.height}
+            </span>
             <span aria-hidden="true">·</span>
             <span>{outMeta.durationSec.toFixed(1)}s</span>
             <span aria-hidden="true">·</span>
             <span>{formatBytes(outMeta.fileSizeBytes)}</span>
             <span aria-hidden="true">·</span>
             <span>{job.characters.length} character profile(s)</span>
-            <span aria-hidden="true">·</span>
-            <span>{job.scenes.length} scene(s)</span>
           </div>
         </div>
 
@@ -174,7 +191,7 @@ export function ResultScreen({ job, onConvertAnother }: ResultScreenProps) {
             }`}
           >
             <Film className="w-3.5 h-3.5" aria-hidden="true" />
-            <span>3D Anime Only</span>
+            <span>3D Only</span>
           </button>
         </div>
       </div>
@@ -213,7 +230,7 @@ export function ResultScreen({ job, onConvertAnother }: ResultScreenProps) {
           <div className="space-y-2">
             <div className="flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
               <span className="font-medium text-blue-600 dark:text-blue-400">
-                Converted 3D Anime
+                Converted {job.visualStyleLabel}
               </span>
               <span className="font-mono tabular-nums">
                 {outMeta.width}x{outMeta.height} · H.264 / AAC
@@ -302,7 +319,7 @@ export function ResultScreen({ job, onConvertAnother }: ResultScreenProps) {
         <div className="mt-5 pt-5 border-t border-zinc-200 dark:border-white/8 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           <button
             type="button"
-            onClick={() => triggerDownload('Downloading converted 3D Anime MP4...')}
+            onClick={() => triggerDownload('Downloading converted 3D MP4...')}
             className="min-h-[48px] px-4 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold inline-flex items-center justify-center gap-2 whitespace-nowrap"
           >
             <Download className="w-4 h-4" aria-hidden="true" />
@@ -353,7 +370,9 @@ export function ResultScreen({ job, onConvertAnother }: ResultScreenProps) {
       {job.characters.length > 0 && (
         <section className="mt-6 bg-white dark:bg-[#131720] border border-zinc-200/90 dark:border-white/8 rounded-2xl p-5 sm:p-6">
           <h2 className="font-display text-base font-semibold text-zinc-900 dark:text-zinc-50 mb-4">
-            Characters Maintained Across All {job.scenes.length} Scene(s)
+            {isNanoBananaFrames
+              ? `Characters Maintained Across All ${job.frames.length} Frame(s)`
+              : `Characters Maintained Across All ${job.scenes.length} Scene(s)`}
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {job.characters.map((char) => (
@@ -363,8 +382,11 @@ export function ResultScreen({ job, onConvertAnother }: ResultScreenProps) {
               >
                 {char.animeRefAsset && (
                   <img
-                    src={`/api/jobs/${job.jobId}/assets/${char.animeRefAsset}`}
-                    alt={`${char.name} 3D Anime portrait`}
+                    src={buildMediaUrl(
+                      `/api/jobs/${job.jobId}/assets/${char.animeRefAsset}`,
+                      job.mediaToken
+                    )}
+                    alt={`${char.name} 3D portrait`}
                     referrerPolicy="no-referrer"
                     className="w-16 h-16 rounded-lg object-cover shrink-0 border border-zinc-200 dark:border-white/10"
                   />

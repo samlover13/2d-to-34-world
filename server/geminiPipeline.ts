@@ -2,20 +2,28 @@ import { GoogleGenAI, Type } from '@google/genai';
 import fs from 'fs';
 import path from 'path';
 import {
+  consumeUserNanoBananaQuota,
   getCharactersForJob,
+  getFramesForJob,
   getRawJob,
   getScenesForJob,
+  getUserDailyQuota,
+  incrementJobNanoBananaCount,
   updateCharacterAssets,
+  updateFrameState,
   updateJobFields,
   updateSceneState,
   upsertCharacters,
+  upsertFrames,
   upsertScenes,
 } from './db.ts';
 import {
+  assembleFramesAndMuxAudio,
   combineScenesAndMuxAudio,
   extractFrameAt,
   extractKeyframes,
   extractOriginalAudio,
+  extractSequenceFrames,
   getTargetDimensions,
   normalizeClipToScene,
   sliceSceneVideo,
@@ -25,6 +33,7 @@ import {
   SceneSegment,
   VideoMetadata,
   VisualStyleDefinition,
+  resolveConversionMode,
   resolveVisualStyle,
 } from './types.ts';
 
@@ -342,6 +351,9 @@ async function runJobPipeline(jobId: string): Promise<void> {
 
   const metadata = JSON.parse(rawJob.metadata_json) as VideoMetadata;
   const visualStyle = resolveVisualStyle(rawJob.visual_style);
+  const conversionMode = resolveConversionMode(rawJob.conversion_mode);
+  const targetFps = Math.max(0.5, Math.min(4, Number(rawJob.target_fps) || 2));
+  const userId = rawJob.user_id;
   const jobDir = getJobWorkDir(jobId);
   const assetsDir = path.join(jobDir, 'assets');
   const framesDir = path.join(jobDir, 'frames');
@@ -368,7 +380,10 @@ async function runJobPipeline(jobId: string): Promise<void> {
       updateJobFields(jobId, {
         current_stage: 2,
         progress: 12,
-        stage_detail: `Extracting keyframes across ${metadata.durationSec.toFixed(1)}s and separating original audio stream...`,
+        stage_detail:
+          conversionMode === 'nano_banana_frames'
+            ? `Extracting sequential frames (${targetFps} FPS) across ${metadata.durationSec.toFixed(1)}s for Nano Banana rendering...`
+            : `Extracting keyframes across ${metadata.durationSec.toFixed(1)}s and separating original audio stream...`,
         estimated_seconds_remaining: null,
       });
 
@@ -380,14 +395,44 @@ async function runJobPipeline(jobId: string): Promise<void> {
         audioPath = null;
       }
 
-      const frames = await extractKeyframes(rawJob.input_path, framesDir, metadata.durationSec);
-      lastCompletedStage = 2;
-      updateJobFields(jobId, {
-        audio_path: audioPath,
-        last_completed_stage: 2,
-        progress: 20,
-        stage_detail: `Extracted ${frames.length} keyframes${audioPath ? ' and original audio track' : ''}.`,
-      });
+      if (conversionMode === 'nano_banana_frames') {
+        const quota = userId ? getUserDailyQuota(userId) : null;
+        // Reserve up to 2 images for character reference portraits when quota allows, and fit frames inside remaining limit
+        const remainingQuota = quota ? quota.imagesRemaining : 60;
+        const maxFramesAllowed = Math.max(2, Math.min(120, remainingQuota));
+        const seqFrames = await extractSequenceFrames({
+          inputPath: rawJob.input_path,
+          assetsDir,
+          durationSec: metadata.durationSec,
+          targetFps,
+          maxFrames: maxFramesAllowed,
+        });
+        upsertFrames(
+          jobId,
+          seqFrames.map((f) => ({
+            frameIndex: f.frameIndex,
+            timestampSec: f.timestampSec,
+            sourceAsset: f.sourceAsset,
+            status: 'pending',
+          }))
+        );
+        lastCompletedStage = 2;
+        updateJobFields(jobId, {
+          audio_path: audioPath,
+          last_completed_stage: 2,
+          progress: 20,
+          stage_detail: `Extracted ${seqFrames.length} sequential frames for Nano Banana${audioPath ? ' + original audio' : ''}.`,
+        });
+      } else {
+        const frames = await extractKeyframes(rawJob.input_path, framesDir, metadata.durationSec);
+        lastCompletedStage = 2;
+        updateJobFields(jobId, {
+          audio_path: audioPath,
+          last_completed_stage: 2,
+          progress: 20,
+          stage_detail: `Extracted ${frames.length} keyframes${audioPath ? ' and original audio track' : ''}.`,
+        });
+      }
     }
 
     // =========================================================================
@@ -574,7 +619,11 @@ Target 3D conversion style: ${visualStyle.name} — ${visualStyle.description}
         stage_detail: `Generating ${visualStyle.name} reference sheets for ${characters.length} detected character(s)...`,
       });
 
-      const charsToProcess = characters.slice(0, 4);
+      const pendingFramesCount =
+        conversionMode === 'nano_banana_frames'
+          ? getFramesForJob(jobId).filter((f) => f.status !== 'completed').length
+          : 0;
+      const charsToProcess = characters.slice(0, conversionMode === 'nano_banana_frames' ? 2 : 4);
       for (let i = 0; i < charsToProcess.length; i++) {
         const char = charsToProcess[i];
         const safeCharId = char.characterId.replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -589,8 +638,24 @@ Target 3D conversion style: ${visualStyle.name} — ${visualStyle.description}
         }
 
         if (!fs.existsSync(animeRefPath)) {
-          const sourceB64 = fs.readFileSync(sourcePath).toString('base64');
-          const refPrompt = `Transform the character "${char.name}" (${char.characterId}) shown in this 2D cartoon frame into a clean ${visualStyle.name} character reference portrait on a neutral soft studio background.
+          // Reserve user's remaining Nano Banana quota for video frames if budget is tight
+          const quotaCheck = userId ? getUserDailyQuota(userId) : null;
+          const canSpendOnPortrait =
+            !quotaCheck ||
+            conversionMode !== 'nano_banana_frames' ||
+            quotaCheck.imagesRemaining > pendingFramesCount;
+
+          if (canSpendOnPortrait) {
+            if (userId) {
+              const consumed = consumeUserNanoBananaQuota(userId, 1);
+              if (!consumed.allowed) {
+                throw new Error(
+                  `Daily Nano Banana image limit (${consumed.quota.dailyLimit}/${consumed.quota.dailyLimit}) reached. Click Resume after your quota resets.`
+                );
+              }
+            }
+            const sourceB64 = fs.readFileSync(sourcePath).toString('base64');
+            const refPrompt = `Transform the character "${char.name}" (${char.characterId}) shown in this 2D cartoon frame into a clean ${visualStyle.name} character reference portrait on a neutral soft studio background.
 Preserve exact character identity and visual traits strictly:
 - Facial features: ${char.facialFeatures}
 - Hair: ${char.hairStyleAndColor}
@@ -601,39 +666,41 @@ Preserve exact character identity and visual traits strictly:
 - Distinctive features: ${char.distinctiveFeatures}
 TARGET VISUAL STYLE (${visualStyle.name}): ${visualStyle.characterRefDirective}`;
 
-          const refImgRes = await withModelFailover(
-            `${visualStyle.name} reference for ${char.name}`,
-            ['gemini-3.1-flash-lite-image', 'gemini-nano-banana-2.1'],
-            (model) =>
-              ai.models.generateContent({
-                model,
-                contents: {
-                  parts: [
-                    {
-                      inlineData: {
-                        mimeType: 'image/jpeg',
-                        data: sourceB64,
+            const refImgRes = await withModelFailover(
+              `${visualStyle.name} reference for ${char.name}`,
+              ['gemini-3.1-flash-lite-image', 'gemini-nano-banana-2.1'],
+              (model) =>
+                ai.models.generateContent({
+                  model,
+                  contents: {
+                    parts: [
+                      {
+                        inlineData: {
+                          mimeType: 'image/jpeg',
+                          data: sourceB64,
+                        },
                       },
-                    },
-                    { text: refPrompt },
-                  ],
-                },
-                config: {
-                  imageConfig: {
-                    aspectRatio: '1:1',
+                      { text: refPrompt },
+                    ],
                   },
-                },
-              }),
-            (statusMsg) => {
-              updateJobFields(jobId, { stage_detail: statusMsg });
-            }
-          );
+                  config: {
+                    imageConfig: {
+                      aspectRatio: '1:1',
+                    },
+                  },
+                }),
+              (statusMsg) => {
+                updateJobFields(jobId, { stage_detail: statusMsg });
+              }
+            );
 
-          const parts = refImgRes.candidates?.[0]?.content?.parts ?? [];
-          const imgPart = parts.find((p) => p.inlineData?.data);
-          if (imgPart?.inlineData?.data) {
-            fs.writeFileSync(animeRefPath, Buffer.from(imgPart.inlineData.data, 'base64'));
-            updateCharacterAssets(jobId, char.characterId, sourceAssetName, animeAssetName);
+            const parts = refImgRes.candidates?.[0]?.content?.parts ?? [];
+            const imgPart = parts.find((p) => p.inlineData?.data);
+            if (imgPart?.inlineData?.data) {
+              fs.writeFileSync(animeRefPath, Buffer.from(imgPart.inlineData.data, 'base64'));
+              updateCharacterAssets(jobId, char.characterId, sourceAssetName, animeAssetName);
+              incrementJobNanoBananaCount(jobId, 1);
+            }
           }
         }
 
@@ -690,7 +757,297 @@ TARGET VISUAL STYLE (${visualStyle.name}): ${visualStyle.characterRefDirective}`
     }
 
     // =========================================================================
-    // STAGE 7: Google Veo (gemini-omni-1.2-flash) generating 3D Anime scenes
+    // STAGE 7: Nano Banana Frame-by-Frame OR Veo Scene-by-Scene Generation
+    // =========================================================================
+    if (conversionMode === 'nano_banana_frames') {
+      let seqFrames = getFramesForJob(jobId);
+      if (seqFrames.length === 0) {
+        const quota = userId ? getUserDailyQuota(userId) : null;
+        const maxFramesAllowed = Math.max(2, Math.min(120, quota ? quota.imagesRemaining : 40));
+        const extracted = await extractSequenceFrames({
+          inputPath: rawJob.input_path,
+          assetsDir,
+          durationSec: metadata.durationSec,
+          targetFps,
+          maxFrames: maxFramesAllowed,
+        });
+        upsertFrames(
+          jobId,
+          extracted.map((f) => ({
+            frameIndex: f.frameIndex,
+            timestampSec: f.timestampSec,
+            sourceAsset: f.sourceAsset,
+            status: 'pending',
+          }))
+        );
+        seqFrames = getFramesForJob(jobId);
+      }
+
+      if (lastCompletedStage < 7) {
+        const aspectRatio: '9:16' | '16:9' =
+          metadata.orientation === 'portrait' ? '9:16' : '16:9';
+        const completedDurationsMs: number[] = seqFrames
+          .filter((f) => f.status === 'completed' && f.durationMs)
+          .map((f) => f.durationMs!);
+
+        const charMap = new Map(characters.map((c) => [c.characterId, c]));
+        let previousRenderedPath: string | null = null;
+
+        for (let i = 0; i < seqFrames.length; i++) {
+          const frame = seqFrames[i];
+          const renderedAssetName = `seq_${String(frame.frameIndex).padStart(4, '0')}_3d.png`;
+          const renderedFullPath = path.join(assetsDir, renderedAssetName);
+          const sourceFullPath = path.join(assetsDir, frame.sourceAsset);
+
+          // Resume support: skip already-completed frames on disk
+          if (
+            frame.status === 'completed' &&
+            frame.renderedAsset &&
+            fs.existsSync(path.join(assetsDir, frame.renderedAsset))
+          ) {
+            previousRenderedPath = path.join(assetsDir, frame.renderedAsset);
+            continue;
+          }
+
+          // Authoritative Nano Banana daily image limit check per signed-in user
+          if (userId) {
+            const quotaCheck = consumeUserNanoBananaQuota(userId, 1);
+            if (!quotaCheck.allowed) {
+              const doneCount = seqFrames.filter((f) => f.status === 'completed').length;
+              throw new Error(
+                `Daily Nano Banana image limit (${quotaCheck.quota.dailyLimit}/${quotaCheck.quota.dailyLimit}) reached after rendering ${doneCount} of ${seqFrames.length} frames. All completed frames are saved — click Resume after your daily quota resets to finish.`
+              );
+            }
+          }
+
+          const remainingCount = seqFrames.length - i;
+          const avgMs =
+            completedDurationsMs.length > 0
+              ? completedDurationsMs.reduce((a, b) => a + b, 0) / completedDurationsMs.length
+              : null;
+          const etaSec = avgMs !== null ? Math.round((avgMs * remainingCount) / 1000) : null;
+
+          updateFrameState(jobId, frame.frameIndex, {
+            status: 'generating',
+            errorMessage: null,
+          });
+          updateJobFields(jobId, {
+            current_stage: 7,
+            progress: 60 + Math.round((i / Math.max(1, seqFrames.length)) * 25),
+            estimated_seconds_remaining: etaSec,
+            stage_detail: `Nano Banana generating 3D frame ${i + 1} of ${seqFrames.length} (${frame.timestampSec.toFixed(1)}s) in ${visualStyle.name} style...`,
+          });
+
+          const frameStartTs = Date.now();
+          const activeScene =
+            scenes.find(
+              (s) => frame.timestampSec >= s.startSec - 0.1 && frame.timestampSec <= s.endSec + 0.1
+            ) ?? scenes[0];
+
+          const activeChars = (activeScene?.characterIds ?? [])
+            .map((id) => charMap.get(id))
+            .filter((c): c is CharacterProfile => Boolean(c));
+          const lockedChars = activeChars.length > 0 ? activeChars : characters.slice(0, 2);
+
+          const parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }> = [
+            {
+              inlineData: {
+                mimeType: 'image/jpeg',
+                data: fs.readFileSync(sourceFullPath).toString('base64'),
+              },
+            },
+          ];
+
+          // Attach up to 2 character reference sheets for consistent identity
+          let attachedRefs = 0;
+          for (const char of lockedChars) {
+            if (attachedRefs >= 2) break;
+            const refAsset = char.animeRefAsset || char.sourceFaceAsset;
+            if (!refAsset) continue;
+            const refPath = path.join(assetsDir, refAsset);
+            if (fs.existsSync(refPath)) {
+              parts.push({
+                inlineData: {
+                  mimeType: refAsset.endsWith('.png') ? 'image/png' : 'image/jpeg',
+                  data: fs.readFileSync(refPath).toString('base64'),
+                },
+              });
+              attachedRefs++;
+            }
+          }
+
+          // Attach previous rendered 3D frame for frame-to-frame temporal continuity
+          const hasPrevFrame = Boolean(previousRenderedPath && fs.existsSync(previousRenderedPath));
+          if (hasPrevFrame && previousRenderedPath) {
+            parts.push({
+              inlineData: {
+                mimeType: 'image/png',
+                data: fs.readFileSync(previousRenderedPath).toString('base64'),
+              },
+            });
+          }
+
+          const charLockText = lockedChars
+            .map(
+              (c) =>
+                `[${c.characterId} ${c.name}]: Face=${c.facialFeatures}; Hair=${c.hairStyleAndColor}; Eyes=${c.eyeShapeAndColor}; Outfit=${c.clothingAndAccessories}; Palette=${c.colorPalette}`
+            )
+            .join(' | ');
+
+          const framePrompt = [
+            `Convert the FIRST image (source 2D cartoon frame #${i + 1} at ${frame.timestampSec.toFixed(2)}s) into a single polished ${visualStyle.name} 3D frame.`,
+            `Preserve the EXACT pose, camera framing, character placement, facial expression, and background layout from the first image.`,
+            hasPrevFrame
+              ? `Use the LAST attached image (the previous rendered 3D frame) to maintain identical 3D lighting, shading, material textures, and background continuity.`
+              : '',
+            `TARGET VISUAL STYLE (${visualStyle.name}): ${visualStyle.videoSceneDirective}`,
+            charLockText ? `CHARACTER CONSISTENCY LOCK: ${charLockText}` : '',
+            activeScene
+              ? `SCENE CONTEXT: ${activeScene.summary}. Lighting & environment: ${activeScene.backgroundAndLighting}.`
+              : '',
+            `Output a clean full-bleed single frame with no borders, no captions, and no watermarks.`,
+          ]
+            .filter(Boolean)
+            .join('\n');
+
+          parts.push({ text: framePrompt });
+
+          try {
+            const imgRes = await withModelFailover(
+              `Nano Banana frame ${i + 1}/${seqFrames.length}`,
+              ['gemini-3.1-flash-lite-image', 'gemini-nano-banana-2.1'],
+              (model) =>
+                ai.models.generateContent({
+                  model,
+                  contents: { parts },
+                  config: {
+                    imageConfig: {
+                      aspectRatio,
+                    },
+                  },
+                }),
+              (statusMsg) => {
+                updateJobFields(jobId, {
+                  stage_detail: `Frame ${i + 1}/${seqFrames.length}: ${statusMsg}`,
+                });
+              }
+            );
+
+            const resParts = imgRes.candidates?.[0]?.content?.parts ?? [];
+            const imgPart = resParts.find((p) => p.inlineData?.data);
+            if (!imgPart?.inlineData?.data) {
+              throw new Error(
+                `Nano Banana did not return image data for frame ${i + 1}. Click Resume to retry.`
+              );
+            }
+
+            fs.writeFileSync(renderedFullPath, Buffer.from(imgPart.inlineData.data, 'base64'));
+            const elapsedMs = Date.now() - frameStartTs;
+            completedDurationsMs.push(elapsedMs);
+            previousRenderedPath = renderedFullPath;
+
+            updateFrameState(jobId, frame.frameIndex, {
+              status: 'completed',
+              renderedAsset: renderedAssetName,
+              errorMessage: null,
+              durationMs: elapsedMs,
+            });
+            incrementJobNanoBananaCount(jobId, 1);
+
+            // Gentle pacing between frames to stay friendly to per-minute Nano Banana rate limits
+            if (i < seqFrames.length - 1) {
+              await new Promise((resolve) => setTimeout(resolve, 900));
+            }
+          } catch (frameErr) {
+            const formatted = formatGeminiError(frameErr);
+            updateFrameState(jobId, frame.frameIndex, {
+              status: 'failed',
+              errorMessage: formatted,
+            });
+            throw frameErr;
+          }
+        }
+
+        seqFrames = getFramesForJob(jobId);
+        lastCompletedStage = 7;
+        updateJobFields(jobId, {
+          last_completed_stage: 7,
+          progress: 86,
+          estimated_seconds_remaining: 10,
+          stage_detail: `All ${seqFrames.length} ${visualStyle.name} frames rendered with Nano Banana.`,
+        });
+      }
+
+      // =========================================================================
+      // STAGE 8, 9, 10 (Nano Banana): Assemble 3D frames + sync audio + render MP4
+      // =========================================================================
+      updateJobFields(jobId, {
+        current_stage: 8,
+        progress: 90,
+        stage_detail: `Stitching ${seqFrames.length} Nano Banana 3D frames into smooth 24fps video...`,
+      });
+
+      const targetDims = getTargetDimensions(metadata);
+      const renderedPaths = seqFrames.map((f) => {
+        if (!f.renderedAsset) {
+          throw new Error(`Missing rendered image for frame ${f.frameIndex + 1}. Click Resume.`);
+        }
+        const full = path.join(assetsDir, f.renderedAsset);
+        if (!fs.existsSync(full)) {
+          throw new Error(`Rendered image file missing for frame ${f.frameIndex + 1}. Click Resume.`);
+        }
+        return full;
+      });
+
+      const combinedSilentPath = path.join(jobDir, 'combined_3d_frames_silent.mp4');
+      const finalMp4Path = path.join(jobDir, 'converted_3d_anime.mp4');
+
+      const outputMetadata = await assembleFramesAndMuxAudio({
+        frameImagePaths: renderedPaths,
+        originalAudioPath: audioPath,
+        combinedSilentPath,
+        finalMp4Path,
+        targetWidth: targetDims.width,
+        targetHeight: targetDims.height,
+        targetDurationSec: metadata.durationSec,
+        onStageSyncAudio: () => {
+          updateJobFields(jobId, {
+            current_stage: 9,
+            last_completed_stage: 8,
+            progress: 94,
+            estimated_seconds_remaining: 5,
+            stage_detail: audioPath
+              ? `Synchronizing original audio track to ${seqFrames.length}-frame ${visualStyle.name} timeline...`
+              : 'Finalizing stereo AAC audio track for universal MP4 playback...',
+          });
+        },
+        onStageRenderFinal: () => {
+          updateJobFields(jobId, {
+            current_stage: 10,
+            last_completed_stage: 9,
+            progress: 97,
+            estimated_seconds_remaining: 2,
+            stage_detail: `Rendering final H.264/AAC MP4 (${targetDims.width}x${targetDims.height})...`,
+          });
+        },
+      });
+
+      updateJobFields(jobId, {
+        status: 'completed',
+        current_stage: 10,
+        last_completed_stage: 10,
+        progress: 100,
+        estimated_seconds_remaining: 0,
+        output_path: finalMp4Path,
+        output_metadata_json: JSON.stringify(outputMetadata),
+        error_message: null,
+        stage_detail: `Completed ${visualStyle.name} Nano Banana MP4 (${seqFrames.length} frames, ${outputMetadata.width}x${outputMetadata.height}, ${outputMetadata.durationSec.toFixed(1)}s).`,
+      });
+      return;
+    }
+
+    // =========================================================================
+    // STAGE 7 (Veo Mode): Google Veo (gemini-omni-1.2-flash) generating 3D scenes
     // =========================================================================
     if (lastCompletedStage < 7) {
       const aspectRatio: '9:16' | '16:9' =
@@ -900,7 +1257,7 @@ TARGET VISUAL STYLE (${visualStyle.name}): ${visualStyle.characterRefDirective}`
     }
 
     // =========================================================================
-    // STAGE 8, 9, 10: Validate, normalize, combine scenes, sync audio, render MP4
+    // STAGE 8, 9, 10 (Veo): Validate, normalize, combine scenes, sync audio, render MP4
     // =========================================================================
     updateJobFields(jobId, {
       current_stage: 8,

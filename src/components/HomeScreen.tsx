@@ -6,25 +6,38 @@ import {
   ChevronRight,
   Clock,
   Film,
+  Layers,
   Loader2,
+  LogOut,
   Moon,
   Play,
   RefreshCw,
   Sun,
   Upload,
 } from 'lucide-react';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ConversionJob,
+  ConversionMode,
+  NanoBananaQuota,
   VISUAL_STYLE_OPTIONS,
   VisualStyleId,
   formatBytes,
   formatDuration,
 } from '../types';
+import { useAuth } from './AuthContext';
 
 const SAMPLE_2D_IMG = '/src/assets/images/sample_2d_cartoon_frame_1795248082485.jpg';
 const SAMPLE_3D_IMG = '/src/assets/images/sample_3d_anime_frame_1795248082337.jpg';
 const CHAR_SHEET_IMG = '/src/assets/images/character_sheet_3d_anime_1795248079417.jpg';
+
+const FPS_OPTIONS: Array<{ value: 'auto' | '1' | '2' | '3' | '4'; label: string }> = [
+  { value: 'auto', label: 'Auto (Fit Limit)' },
+  { value: '1', label: '1 FPS' },
+  { value: '2', label: '2 FPS' },
+  { value: '3', label: '3 FPS' },
+  { value: '4', label: '4 FPS' },
+];
 
 interface LocalVideoSelection {
   file: File;
@@ -44,6 +57,29 @@ interface HomeScreenProps {
   onViewAllHistory: () => void;
 }
 
+function GoogleMark() {
+  return (
+    <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        fill="#4285F4"
+        d="M23.49 12.27c0-.79-.07-1.54-.2-2.27H12v4.3h6.44a5.5 5.5 0 0 1-2.39 3.61v3h3.87c2.26-2.08 3.57-5.15 3.57-8.64Z"
+      />
+      <path
+        fill="#34A853"
+        d="M12 24c3.24 0 5.95-1.07 7.93-2.91l-3.87-3c-1.07.72-2.44 1.15-4.06 1.15-3.12 0-5.77-2.11-6.71-4.95H1.29v3.1A12 12 0 0 0 12 24Z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M5.29 14.29A7.18 7.18 0 0 1 4.91 12c0-.79.14-1.56.38-2.29v-3.1H1.29A12 12 0 0 0 0 12c0 1.94.46 3.77 1.29 5.39l4-3.1Z"
+      />
+      <path
+        fill="#EA4335"
+        d="M12 4.76c1.76 0 3.34.61 4.59 1.8l3.44-3.44C17.95 1.19 15.24 0 12 0A12 12 0 0 0 1.29 6.61l4 3.1C6.23 6.87 8.88 4.76 12 4.76Z"
+      />
+    </svg>
+  );
+}
+
 export function HomeScreen({
   recentJobs,
   isDark,
@@ -53,8 +89,23 @@ export function HomeScreen({
   onOpenJob,
   onViewAllHistory,
 }: HomeScreenProps) {
+  const {
+    user,
+    authReady,
+    isSigningIn,
+    authError,
+    quota,
+    signInWithGoogle,
+    signOutGoogle,
+    getIdToken,
+    updateQuota,
+    savePreferences,
+  } = useAuth();
+
   const [selectedVideo, setSelectedVideo] = useState<LocalVideoSelection | null>(null);
   const [selectedStyle, setSelectedStyle] = useState<VisualStyleId>('pixar_3d');
+  const [conversionMode, setConversionMode] = useState<ConversionMode>('nano_banana_frames');
+  const [targetFpsOption, setTargetFpsOption] = useState<'auto' | '1' | '2' | '3' | '4'>('auto');
   const [validationError, setValidationError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -62,11 +113,16 @@ export function HomeScreen({
   const [isDragging, setIsDragging] = useState(false);
   const [sliderPos, setSliderPos] = useState(50);
   const [imgErrors, setImgErrors] = useState<Record<string, boolean>>({});
+  const [avatarError, setAvatarError] = useState(false);
 
   const activeStyleOption =
     VISUAL_STYLE_OPTIONS.find((opt) => opt.id === selectedStyle) ?? VISUAL_STYLE_OPTIONS[0];
 
   const previewUrlRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    setAvatarError(false);
+  }, [user?.photoURL]);
 
   useEffect(() => {
     return () => {
@@ -75,6 +131,32 @@ export function HomeScreen({
       }
     };
   }, []);
+
+  const frameBudgetPreview = useMemo(() => {
+    const remaining = quota?.imagesRemaining ?? 100;
+    const duration = selectedVideo?.durationSec ?? 6;
+    if (conversionMode !== 'nano_banana_frames') return null;
+
+    let effectiveFps: number;
+    if (targetFpsOption === 'auto') {
+      const fitBudget = Math.max(2, Math.min(36, remaining - 2));
+      const computed = fitBudget / Math.max(1, duration);
+      effectiveFps = Math.max(0.5, Math.min(4, Math.round(computed * 2) / 2));
+    } else {
+      effectiveFps = Number(targetFpsOption);
+    }
+
+    const desiredFrames = Math.max(2, Math.round(duration * effectiveFps));
+    const cappedFrames = Math.max(0, Math.min(desiredFrames, Math.max(0, remaining)));
+    const wasCapped = desiredFrames > remaining;
+    return {
+      effectiveFps,
+      desiredFrames,
+      cappedFrames,
+      wasCapped,
+      remaining,
+    };
+  }, [conversionMode, quota, selectedVideo, targetFpsOption]);
 
   const inspectSelectedFile = (file: File) => {
     setValidationError(null);
@@ -180,19 +262,34 @@ export function HomeScreen({
   };
 
   const handleStartConversion = async () => {
+    if (!user) {
+      await signInWithGoogle();
+      return;
+    }
     if (!selectedVideo || isUploading) return;
     setValidationError(null);
     setIsUploading(true);
     setUploadProgress(0);
 
     try {
+      const idToken = await getIdToken();
+      if (!idToken) {
+        throw new Error('Your Google session expired. Please sign in with Google again.');
+      }
+
       const formData = new FormData();
       formData.append('video', selectedVideo.file);
       formData.append('visual_style', selectedStyle);
+      formData.append('conversion_mode', conversionMode);
+      formData.append('target_fps', targetFpsOption);
 
-      const createdJob = await new Promise<ConversionJob>((resolve, reject) => {
+      const responsePayload = await new Promise<{
+        job: ConversionJob;
+        quota?: NanoBananaQuota;
+      }>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/jobs');
+        xhr.setRequestHeader('Authorization', `Bearer ${idToken}`);
 
         xhr.upload.onprogress = (evt) => {
           if (evt.lengthComputable) {
@@ -204,8 +301,14 @@ export function HomeScreen({
           try {
             const parsed = JSON.parse(xhr.responseText);
             if (xhr.status >= 200 && xhr.status < 300 && parsed.job) {
-              resolve(parsed.job as ConversionJob);
+              resolve({
+                job: parsed.job as ConversionJob,
+                quota: parsed.quota as NanoBananaQuota | undefined,
+              });
             } else {
+              if (parsed.quota) {
+                updateQuota(parsed.quota as NanoBananaQuota);
+              }
               reject(new Error(parsed.error || `Upload rejected (${xhr.status}).`));
             }
           } catch {
@@ -220,7 +323,11 @@ export function HomeScreen({
         xhr.send(formData);
       });
 
-      onJobStarted(createdJob);
+      savePreferences(selectedStyle, conversionMode);
+      if (responsePayload.quota) {
+        updateQuota(responsePayload.quota, responsePayload.job.jobId);
+      }
+      onJobStarted(responsePayload.job);
     } catch (err) {
       setValidationError(
         err instanceof Error ? err.message : 'Failed to upload video and start conversion.'
@@ -230,6 +337,15 @@ export function HomeScreen({
       setUploadProgress(0);
     }
   };
+
+  const quotaPct = quota
+    ? Math.max(0, Math.min(100, Math.round((quota.imagesRemaining / Math.max(1, quota.dailyLimit)) * 100)))
+    : 100;
+  const quotaDepleted =
+    Boolean(user) &&
+    conversionMode === 'nano_banana_frames' &&
+    quota !== null &&
+    quota.imagesRemaining < 2;
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 pt-6 pb-24 md:pb-12">
@@ -247,11 +363,11 @@ export function HomeScreen({
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 pb-6 border-b border-zinc-200 dark:border-white/8">
         <div>
           <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-zinc-900 dark:text-zinc-50 text-balance">
-            2D Cartoon to 3D Anime Video Converter
+            2D Cartoon to 3D Video Converter
           </h1>
           <p className="mt-1.5 text-sm sm:text-base text-zinc-600 dark:text-zinc-400 max-w-2xl">
-            Upload a 2D cartoon clip up to 60 seconds. Gemini analyzes every scene and character,
-            locks consistent 3D character profiles, and renders one synchronized MP4 with Veo.
+            Sign in with Google to use your daily Nano Banana image generation limit for
+            frame-by-frame 3D conversion with locked character consistency and original audio sync.
           </p>
         </div>
 
@@ -274,9 +390,121 @@ export function HomeScreen({
         </button>
       </div>
 
+      {/* Front-Page Google Login & Nano Banana Daily Limit Bar */}
+      <section className="mt-6 bg-white dark:bg-[#131720] border border-zinc-200/90 dark:border-white/8 rounded-2xl p-4 sm:p-5">
+        {!authReady ? (
+          <div className="flex items-center gap-3 text-sm text-zinc-500 dark:text-zinc-400 py-1">
+            <Loader2 className="w-4 h-4 animate-spin shrink-0" aria-hidden="true" />
+            <span>Checking Google sign-in session...</span>
+          </div>
+        ) : !user ? (
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="min-w-0">
+              <h2 className="font-display text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                Login with Google to Activate Nano Banana Frame-by-Frame Quota
+              </h2>
+              <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                Each signed-in Google account gets a tracked daily Nano Banana image limit (100
+                frames/day) used to render your 2D cartoon frame by frame with automatic checkpoint
+                resume if you pause or reach today&apos;s limit.
+              </p>
+              {authError && (
+                <p
+                  role="alert"
+                  className="mt-2 text-xs font-medium text-red-600 dark:text-red-400 flex items-center gap-1.5"
+                >
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span>{authError}</span>
+                </p>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={signInWithGoogle}
+              disabled={isSigningIn}
+              className="w-full md:w-auto inline-flex items-center justify-center gap-2.5 px-5 py-2.5 min-h-[46px] rounded-xl bg-white dark:bg-zinc-100 hover:bg-zinc-50 dark:hover:bg-white text-zinc-900 border border-zinc-300 dark:border-zinc-200 text-sm font-semibold transition-colors whitespace-nowrap shrink-0 shadow-xs disabled:opacity-60"
+            >
+              {isSigningIn ? (
+                <Loader2 className="w-4 h-4 animate-spin text-zinc-700" aria-hidden="true" />
+              ) : (
+                <GoogleMark />
+              )}
+              <span>{isSigningIn ? 'Signing in...' : 'Continue with Google'}</span>
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            {/* Signed-in Google Profile */}
+            <div className="flex items-center gap-3 min-w-0">
+              {user.photoURL && !avatarError ? (
+                <img
+                  src={user.photoURL}
+                  alt={user.displayName || 'Google user avatar'}
+                  referrerPolicy="no-referrer"
+                  onError={() => setAvatarError(true)}
+                  className="w-10 h-10 rounded-full object-cover border border-zinc-200 dark:border-white/10 shrink-0"
+                />
+              ) : (
+                <div className="w-10 h-10 rounded-full bg-blue-600 text-white font-semibold text-sm flex items-center justify-center shrink-0">
+                  {(user.displayName || user.email || 'G').charAt(0).toUpperCase()}
+                </div>
+              )}
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-100 truncate">
+                  {user.displayName || 'Google Account'}
+                </p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">
+                  {user.email}
+                </p>
+              </div>
+            </div>
+
+            {/* Live Nano Banana Daily Image Limit Meter */}
+            <div className="flex-1 lg:max-w-md">
+              <div className="flex items-baseline justify-between gap-2 text-xs">
+                <span className="font-medium text-zinc-700 dark:text-zinc-300">
+                  Nano Banana Daily Image Limit
+                </span>
+                <span className="font-mono tabular-nums text-zinc-900 dark:text-zinc-100 font-semibold">
+                  {quota ? `${quota.imagesRemaining} / ${quota.dailyLimit} left today` : 'Loading...'}
+                </span>
+              </div>
+              <div className="mt-1.5 h-2 w-full rounded-full bg-zinc-200 dark:bg-white/10 overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all duration-300 ${
+                    quotaPct <= 10
+                      ? 'bg-red-500'
+                      : quotaPct <= 30
+                        ? 'bg-amber-500'
+                        : 'bg-blue-600'
+                  }`}
+                  style={{ width: `${quotaPct}%` }}
+                />
+              </div>
+              {quota && (
+                <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
+                  Used {quota.imagesUsed} images · Model {quota.modelName} · Resets daily UTC
+                </p>
+              )}
+            </div>
+
+            {/* Sign out */}
+            <button
+              type="button"
+              onClick={signOutGoogle}
+              className="self-start lg:self-auto inline-flex items-center gap-2 px-3.5 py-2 min-h-[44px] rounded-xl border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#0E1118] hover:bg-zinc-100 dark:hover:bg-white/5 text-xs font-medium text-zinc-700 dark:text-zinc-300 transition-colors whitespace-nowrap shrink-0"
+            >
+              <LogOut className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Sign out</span>
+            </button>
+          </div>
+        )}
+      </section>
+
       {/* Main 2-Column Studio Workspace */}
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Left Dominant Focal Anchor: Video Upload + Preview + Convert CTA */}
+        {/* Left Dominant Focal Anchor: Video Upload + Engine + Style + Convert CTA */}
         <section className="lg:col-span-7 bg-white dark:bg-[#131720] border border-zinc-200/90 dark:border-white/8 rounded-2xl p-5 sm:p-6">
           <div className="flex items-center justify-between gap-4 mb-4">
             <div>
@@ -366,7 +594,10 @@ export function HomeScreen({
                     {selectedVideo.file.name}
                   </p>
                   <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
-                    <span>Duration {formatDuration(selectedVideo.durationSec)} ({selectedVideo.durationSec.toFixed(1)}s)</span>
+                    <span>
+                      Duration {formatDuration(selectedVideo.durationSec)} (
+                      {selectedVideo.durationSec.toFixed(1)}s)
+                    </span>
                     <span aria-hidden="true">·</span>
                     <span>{formatBytes(selectedVideo.file.size)}</span>
                     <span aria-hidden="true">·</span>
@@ -380,6 +611,161 @@ export function HomeScreen({
             </div>
           )}
 
+          {/* Conversion Engine & Nano Banana Frame Budget */}
+          <div className="mt-6 pt-5 border-t border-zinc-200 dark:border-white/8">
+            <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+              <div className="flex items-center gap-2">
+                <Layers className="w-4 h-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+                <h3 className="font-display text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                  Conversion Engine
+                </h3>
+              </div>
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                {conversionMode === 'nano_banana_frames'
+                  ? 'Uses your Google daily Nano Banana limit'
+                  : 'Uses Veo video scene synthesis'}
+              </span>
+            </div>
+
+            <div
+              role="radiogroup"
+              aria-label="Select conversion engine"
+              className="grid grid-cols-1 sm:grid-cols-2 gap-2.5"
+            >
+              <button
+                type="button"
+                role="radio"
+                aria-checked={conversionMode === 'nano_banana_frames'}
+                disabled={isUploading}
+                onClick={() => setConversionMode('nano_banana_frames')}
+                className={`text-left p-3.5 min-h-[44px] rounded-xl border transition-colors flex flex-col justify-between gap-1 disabled:opacity-60 ${
+                  conversionMode === 'nano_banana_frames'
+                    ? 'border-blue-600 dark:border-blue-500 bg-blue-50/80 dark:bg-blue-500/12'
+                    : 'border-zinc-200 dark:border-white/10 bg-zinc-50/60 dark:bg-[#0E1118] hover:border-zinc-300 dark:hover:border-white/20'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2 w-full">
+                  <span
+                    className={`text-sm font-semibold ${
+                      conversionMode === 'nano_banana_frames'
+                        ? 'text-blue-700 dark:text-blue-300'
+                        : 'text-zinc-900 dark:text-zinc-100'
+                    }`}
+                  >
+                    Nano Banana Frame-by-Frame
+                  </span>
+                  <span
+                    aria-hidden="true"
+                    className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 ${
+                      conversionMode === 'nano_banana_frames'
+                        ? 'border-blue-600 bg-blue-600 text-white'
+                        : 'border-zinc-300 dark:border-white/20'
+                    }`}
+                  >
+                    {conversionMode === 'nano_banana_frames' && (
+                      <Check className="w-3 h-3 stroke-[2.75]" />
+                    )}
+                  </span>
+                </div>
+                <p className="text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+                  Converts every extracted 2D frame into 3D with previous-frame continuity and
+                  assembles the sequence with original audio.
+                </p>
+              </button>
+
+              <button
+                type="button"
+                role="radio"
+                aria-checked={conversionMode === 'veo_scenes'}
+                disabled={isUploading}
+                onClick={() => setConversionMode('veo_scenes')}
+                className={`text-left p-3.5 min-h-[44px] rounded-xl border transition-colors flex flex-col justify-between gap-1 disabled:opacity-60 ${
+                  conversionMode === 'veo_scenes'
+                    ? 'border-blue-600 dark:border-blue-500 bg-blue-50/80 dark:bg-blue-500/12'
+                    : 'border-zinc-200 dark:border-white/10 bg-zinc-50/60 dark:bg-[#0E1118] hover:border-zinc-300 dark:hover:border-white/20'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2 w-full">
+                  <span
+                    className={`text-sm font-semibold ${
+                      conversionMode === 'veo_scenes'
+                        ? 'text-blue-700 dark:text-blue-300'
+                        : 'text-zinc-900 dark:text-zinc-100'
+                    }`}
+                  >
+                    Veo Scene-by-Scene
+                  </span>
+                  <span
+                    aria-hidden="true"
+                    className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 ${
+                      conversionMode === 'veo_scenes'
+                        ? 'border-blue-600 bg-blue-600 text-white'
+                        : 'border-zinc-300 dark:border-white/20'
+                    }`}
+                  >
+                    {conversionMode === 'veo_scenes' && (
+                      <Check className="w-3 h-3 stroke-[2.75]" />
+                    )}
+                  </span>
+                </div>
+                <p className="text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+                  Generates animated 3D scene video segments with Google Veo using locked character
+                  portraits and starting keyframes.
+                </p>
+              </button>
+            </div>
+
+            {/* Frame Density Selector for Nano Banana Frame-by-Frame */}
+            {conversionMode === 'nano_banana_frames' && (
+              <div className="mt-3.5 rounded-xl bg-zinc-50 dark:bg-[#0E1118] border border-zinc-200/80 dark:border-white/8 p-3.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                    Frame Sampling Density
+                  </span>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {FPS_OPTIONS.map((opt) => {
+                      const active = targetFpsOption === opt.value;
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          disabled={isUploading}
+                          onClick={() => setTargetFpsOption(opt.value)}
+                          className={`px-2.5 py-1.5 min-h-[34px] rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
+                            active
+                              ? 'bg-blue-600 text-white'
+                              : 'bg-white dark:bg-[#161B26] border border-zinc-200 dark:border-white/10 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-white/5'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                {frameBudgetPreview && (
+                  <p className="mt-2 text-xs text-zinc-600 dark:text-zinc-400 font-mono tabular-nums">
+                    {selectedVideo ? (
+                      <>
+                        Estimated ~{frameBudgetPreview.cappedFrames} Nano Banana frames (
+                        {frameBudgetPreview.effectiveFps} FPS × {selectedVideo.durationSec.toFixed(1)}s)
+                        {user && quota ? ` · ${quota.imagesRemaining} remaining today` : ''}
+                        {frameBudgetPreview.wasCapped
+                          ? ' · auto-capped to remaining daily limit'
+                          : ''}
+                      </>
+                    ) : (
+                      <>
+                        Select a video to calculate exact frame count · Auto fits inside your
+                        remaining daily Nano Banana limit
+                      </>
+                    )}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* 3D Cartoon Visual Style Selector */}
           <div className="mt-6 pt-5 border-t border-zinc-200 dark:border-white/8">
             <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
@@ -388,7 +774,9 @@ export function HomeScreen({
                   3D Cartoon Visual Style
                 </h3>
                 <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
-                  Applied consistently across Gemini character sheets and every Veo scene
+                  {conversionMode === 'nano_banana_frames'
+                    ? 'Applied consistently across every Nano Banana 3D frame and character portrait'
+                    : 'Applied consistently across character reference portraits and every Veo scene'}
                 </p>
               </div>
               <span className="text-xs font-medium text-blue-600 dark:text-blue-400">
@@ -460,27 +848,51 @@ export function HomeScreen({
           {/* Primary Convert CTA */}
           <div className="mt-6 pt-5 border-t border-zinc-200 dark:border-white/8 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="text-xs text-zinc-500 dark:text-zinc-400">
-              Style: {activeStyleOption.name} · H.264 MP4 · AAC original audio · Automatic character lock
+              {conversionMode === 'nano_banana_frames'
+                ? `Nano Banana Frame-by-Frame · ${activeStyleOption.name} · H.264 MP4 · Original AAC audio`
+                : `Veo Scene Synthesis · ${activeStyleOption.name} · H.264 MP4 · Original AAC audio`}
             </div>
 
-            <button
-              type="button"
-              onClick={handleStartConversion}
-              disabled={!selectedVideo || isUploading}
-              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3 min-h-[48px] rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-zinc-300 dark:disabled:bg-zinc-800 disabled:text-zinc-500 dark:disabled:text-zinc-500 text-white font-semibold text-sm transition-colors whitespace-nowrap shrink-0"
-            >
-              {isUploading ? (
-                <>
+            {!user ? (
+              <button
+                type="button"
+                onClick={signInWithGoogle}
+                disabled={isSigningIn}
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3 min-h-[48px] rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm transition-colors whitespace-nowrap shrink-0 disabled:opacity-60"
+              >
+                {isSigningIn ? (
                   <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
-                  <span className="tabular-nums">Uploading {uploadProgress}%</span>
-                </>
-              ) : (
-                <>
-                  <span>Convert to 3D</span>
-                  <ArrowRight className="w-4 h-4" aria-hidden="true" />
-                </>
-              )}
-            </button>
+                ) : (
+                  <GoogleMark />
+                )}
+                <span>Sign in with Google to Convert</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleStartConversion}
+                disabled={!selectedVideo || isUploading || quotaDepleted}
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3 min-h-[48px] rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-zinc-300 dark:disabled:bg-zinc-800 disabled:text-zinc-500 dark:disabled:text-zinc-500 text-white font-semibold text-sm transition-colors whitespace-nowrap shrink-0"
+              >
+                {isUploading ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+                    <span className="tabular-nums">Uploading {uploadProgress}%</span>
+                  </>
+                ) : quotaDepleted ? (
+                  <span>Daily Nano Banana Limit Reached</span>
+                ) : (
+                  <>
+                    <span>
+                      {conversionMode === 'nano_banana_frames'
+                        ? 'Convert Frame-by-Frame'
+                        : 'Convert to 3D'}
+                    </span>
+                    <ArrowRight className="w-4 h-4" aria-hidden="true" />
+                  </>
+                )}
+              </button>
+            )}
           </div>
         </section>
 
@@ -489,7 +901,7 @@ export function HomeScreen({
           <div className="bg-white dark:bg-[#131720] border border-zinc-200/90 dark:border-white/8 rounded-2xl p-5">
             <div className="flex items-center justify-between gap-2 mb-3">
               <h2 className="font-display text-base font-semibold text-zinc-900 dark:text-zinc-50">
-                2D Cartoon vs 3D Anime Output
+                2D Cartoon vs 3D Output
               </h2>
               <span className="text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
                 Drag slider
@@ -501,14 +913,14 @@ export function HomeScreen({
               {!imgErrors.after ? (
                 <img
                   src={SAMPLE_3D_IMG}
-                  alt="3D Anime rendered hilltop scene"
+                  alt="3D rendered hilltop scene"
                   referrerPolicy="no-referrer"
                   onError={() => setImgErrors((prev) => ({ ...prev, after: true }))}
                   className="absolute inset-0 w-full h-full object-cover"
                 />
               ) : (
                 <div className="absolute inset-0 bg-gradient-to-br from-blue-950 to-zinc-900 flex items-center justify-center text-xs text-zinc-400">
-                  3D Anime Render Preview
+                  3D Render Preview
                 </div>
               )}
 
@@ -544,7 +956,7 @@ export function HomeScreen({
               {/* Measured scrim labels */}
               <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/35 to-transparent px-3 py-2 flex items-center justify-between text-xs font-medium text-white pointer-events-none">
                 <span>Original 2D</span>
-                <span>Converted 3D Anime</span>
+                <span>Converted 3D</span>
               </div>
 
               <input
@@ -553,7 +965,7 @@ export function HomeScreen({
                 max={95}
                 value={sliderPos}
                 onChange={(e) => setSliderPos(Number(e.target.value))}
-                aria-label="Compare 2D cartoon source and 3D anime output"
+                aria-label="Compare 2D cartoon source and 3D output"
                 className="absolute inset-0 w-full h-full opacity-0 cursor-ew-resize"
               />
             </div>
@@ -564,7 +976,7 @@ export function HomeScreen({
                 {!imgErrors.charSheet ? (
                   <img
                     src={CHAR_SHEET_IMG}
-                    alt="3D Anime Character Reference Turnaround"
+                    alt="3D Character Reference Turnaround"
                     referrerPolicy="no-referrer"
                     onError={() => setImgErrors((prev) => ({ ...prev, charSheet: true }))}
                     className="w-full h-full object-cover"
@@ -577,11 +989,12 @@ export function HomeScreen({
               </div>
               <div className="min-w-0">
                 <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-                  Persistent Character Consistency Engine
+                  Frame-by-Frame Temporal Consistency
                 </h3>
                 <p className="mt-0.5 text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
-                  Locks every character&apos;s face, hairstyle, eyes, outfit, and color palette into
-                  reusable 3D reference portraits fed into every Veo scene segment.
+                  Every Nano Banana frame receives the locked 3D character portraits plus the
+                  previous rendered 3D frame so faces, outfits, and lighting stay consistent from
+                  start to finish.
                 </p>
               </div>
             </div>
@@ -595,7 +1008,7 @@ export function HomeScreen({
           <h2 className="font-display text-base font-semibold text-zinc-900 dark:text-zinc-50">
             Recent Conversion History
           </h2>
-          {recentJobs.length > 0 && (
+          {user && recentJobs.length > 0 && (
             <button
               type="button"
               onClick={onViewAllHistory}
@@ -606,10 +1019,15 @@ export function HomeScreen({
           )}
         </div>
 
-        {recentJobs.length === 0 ? (
+        {!user ? (
+          <div className="px-6 py-10 text-center text-sm text-zinc-500 dark:text-zinc-400">
+            Sign in with Google above to view your personal conversion history and track your daily
+            Nano Banana frame budget.
+          </div>
+        ) : recentJobs.length === 0 ? (
           <div className="px-6 py-10 text-center text-sm text-zinc-500 dark:text-zinc-400">
             No conversions yet. Upload a 2D cartoon video or load the 6-second sample above to run
-            the automated Gemini + Veo pipeline.
+            Nano Banana frame-by-frame conversion.
           </div>
         ) : (
           <div className="divide-y divide-zinc-200/80 dark:divide-white/6">
@@ -623,11 +1041,20 @@ export function HomeScreen({
                 <div className="flex items-center gap-3.5 min-w-0">
                   <div className="w-9 h-9 rounded-xl bg-zinc-100 dark:bg-white/6 flex items-center justify-center shrink-0">
                     {job.status === 'completed' ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                      <CheckCircle2
+                        className="w-4 h-4 text-emerald-600 dark:text-emerald-400"
+                        aria-hidden="true"
+                      />
                     ) : job.status === 'failed' ? (
-                      <RefreshCw className="w-4 h-4 text-red-600 dark:text-red-400" aria-hidden="true" />
+                      <RefreshCw
+                        className="w-4 h-4 text-red-600 dark:text-red-400"
+                        aria-hidden="true"
+                      />
                     ) : (
-                      <Clock className="w-4 h-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+                      <Clock
+                        className="w-4 h-4 text-blue-600 dark:text-blue-400"
+                        aria-hidden="true"
+                      />
                     )}
                   </div>
                   <div className="min-w-0">
@@ -635,11 +1062,13 @@ export function HomeScreen({
                       {job.originalFilename}
                     </p>
                     <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">
-                      <span>{formatDuration(job.metadata.durationSec)}</span>
-                      <span aria-hidden="true">·</span>
-                      <span>
-                        {job.metadata.width}x{job.metadata.height}
+                      <span className="font-sans">
+                        {job.conversionMode === 'nano_banana_frames'
+                          ? `Nano Banana (${job.frames.length} frames)`
+                          : `Veo (${job.scenes.length} scenes)`}
                       </span>
+                      <span aria-hidden="true">·</span>
+                      <span>{formatDuration(job.metadata.durationSec)}</span>
                       <span aria-hidden="true">·</span>
                       <span className="font-sans">{job.visualStyleLabel}</span>
                       <span aria-hidden="true">·</span>
@@ -647,7 +1076,7 @@ export function HomeScreen({
                         {job.status === 'completed'
                           ? 'Completed'
                           : job.status === 'failed'
-                            ? `Failed at Stage ${job.currentStage} (Resumable)`
+                            ? `Paused at Stage ${job.currentStage} (Resumable)`
                             : `${job.currentStageLabel} (${job.progress}%)`}
                       </span>
                     </div>

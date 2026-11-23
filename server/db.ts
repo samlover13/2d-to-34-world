@@ -3,14 +3,20 @@ import fs from 'fs';
 import path from 'path';
 import {
   CharacterProfile,
+  ConversionMode,
+  DEFAULT_CONVERSION_MODE,
   DEFAULT_VISUAL_STYLE,
+  FrameItem,
+  FrameStatus,
   JobResponse,
   JobStatus,
+  NanoBananaQuota,
   PIPELINE_STAGES,
   SceneSegment,
   SceneStatus,
   VideoMetadata,
   VisualStyleId,
+  resolveConversionMode,
   resolveVisualStyle,
 } from './types.ts';
 
@@ -22,11 +28,21 @@ const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
+export const NANO_BANANA_DAILY_LIMIT = Math.max(
+  10,
+  Math.min(500, Number(process.env.NANO_BANANA_DAILY_LIMIT || 100) || 100)
+);
+export const NANO_BANANA_PRIMARY_MODEL = 'gemini-3.1-flash-lite-image';
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
+    user_id TEXT,
     original_filename TEXT NOT NULL,
     visual_style TEXT NOT NULL DEFAULT 'pixar_3d',
+    conversion_mode TEXT NOT NULL DEFAULT 'nano_banana_frames',
+    target_fps REAL NOT NULL DEFAULT 2,
+    nano_banana_images_used INTEGER NOT NULL DEFAULT 0,
     input_path TEXT NOT NULL,
     audio_path TEXT,
     output_path TEXT,
@@ -42,6 +58,15 @@ db.exec(`
     analysis_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS user_daily_quota (
+    user_id TEXT NOT NULL,
+    date_key TEXT NOT NULL,
+    images_used INTEGER NOT NULL DEFAULT 0,
+    daily_limit INTEGER NOT NULL DEFAULT 100,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, date_key)
   );
 
   CREATE TABLE IF NOT EXISTS characters (
@@ -84,18 +109,138 @@ db.exec(`
     UNIQUE(job_id, scene_index),
     FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
   );
+
+  CREATE TABLE IF NOT EXISTS job_frames (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    frame_index INTEGER NOT NULL,
+    timestamp_sec REAL NOT NULL,
+    source_asset TEXT NOT NULL,
+    rendered_asset TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error_message TEXT,
+    duration_ms INTEGER,
+    UNIQUE(job_id, frame_index),
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+  );
 `);
 
-// Safe schema migration for existing SQLite databases created prior to visual_style support
-const existingCols = db.prepare("PRAGMA table_info('jobs')").all() as Array<{ name: string }>;
-if (!existingCols.some((col) => col.name === 'visual_style')) {
+// Safe additive schema migrations for existing SQLite databases
+const existingCols = new Set(
+  (db.prepare("PRAGMA table_info('jobs')").all() as Array<{ name: string }>).map((c) => c.name)
+);
+if (!existingCols.has('visual_style')) {
   db.exec(`ALTER TABLE jobs ADD COLUMN visual_style TEXT NOT NULL DEFAULT '${DEFAULT_VISUAL_STYLE}'`);
+}
+if (!existingCols.has('user_id')) {
+  db.exec(`ALTER TABLE jobs ADD COLUMN user_id TEXT`);
+}
+if (!existingCols.has('conversion_mode')) {
+  db.exec(`ALTER TABLE jobs ADD COLUMN conversion_mode TEXT NOT NULL DEFAULT '${DEFAULT_CONVERSION_MODE}'`);
+}
+if (!existingCols.has('target_fps')) {
+  db.exec(`ALTER TABLE jobs ADD COLUMN target_fps REAL NOT NULL DEFAULT 2`);
+}
+if (!existingCols.has('nano_banana_images_used')) {
+  db.exec(`ALTER TABLE jobs ADD COLUMN nano_banana_images_used INTEGER NOT NULL DEFAULT 0`);
+}
+
+export function getUtcDateKey(date = new Date()): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function getNextUtcResetIso(date = new Date()): string {
+  const next = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1, 0, 0, 0));
+  return next.toISOString();
+}
+
+export function getUserDailyQuota(userId: string): NanoBananaQuota {
+  const dateKey = getUtcDateKey();
+  const row = db
+    .prepare('SELECT images_used, daily_limit FROM user_daily_quota WHERE user_id = ? AND date_key = ?')
+    .get(userId, dateKey) as { images_used: number; daily_limit: number } | undefined;
+
+  const dailyLimit = row?.daily_limit ?? NANO_BANANA_DAILY_LIMIT;
+  const imagesUsed = row?.images_used ?? 0;
+
+  return {
+    dateKey,
+    dailyLimit,
+    imagesUsed,
+    imagesRemaining: Math.max(0, dailyLimit - imagesUsed),
+    modelName: NANO_BANANA_PRIMARY_MODEL,
+    resetAtUtc: getNextUtcResetIso(),
+  };
+}
+
+export function consumeUserNanoBananaQuota(
+  userId: string,
+  count = 1
+): { allowed: boolean; quota: NanoBananaQuota } {
+  const dateKey = getUtcDateKey();
+  const now = new Date().toISOString();
+
+  const tx = db.transaction(() => {
+    const existing = db
+      .prepare('SELECT images_used, daily_limit FROM user_daily_quota WHERE user_id = ? AND date_key = ?')
+      .get(userId, dateKey) as { images_used: number; daily_limit: number } | undefined;
+
+    const dailyLimit = existing?.daily_limit ?? NANO_BANANA_DAILY_LIMIT;
+    const currentUsed = existing?.images_used ?? 0;
+
+    if (currentUsed + count > dailyLimit) {
+      return {
+        allowed: false,
+        quota: {
+          dateKey,
+          dailyLimit,
+          imagesUsed: currentUsed,
+          imagesRemaining: Math.max(0, dailyLimit - currentUsed),
+          modelName: NANO_BANANA_PRIMARY_MODEL,
+          resetAtUtc: getNextUtcResetIso(),
+        },
+      };
+    }
+
+    const nextUsed = currentUsed + count;
+    db.prepare(
+      `INSERT INTO user_daily_quota (user_id, date_key, images_used, daily_limit, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, date_key) DO UPDATE SET
+         images_used = excluded.images_used,
+         updated_at = excluded.updated_at`
+    ).run(userId, dateKey, nextUsed, dailyLimit, now);
+
+    return {
+      allowed: true,
+      quota: {
+        dateKey,
+        dailyLimit,
+        imagesUsed: nextUsed,
+        imagesRemaining: Math.max(0, dailyLimit - nextUsed),
+        modelName: NANO_BANANA_PRIMARY_MODEL,
+        resetAtUtc: getNextUtcResetIso(),
+      },
+    };
+  });
+
+  return tx();
+}
+
+export function incrementJobNanoBananaCount(jobId: string, delta = 1): void {
+  db.prepare(
+    `UPDATE jobs SET nano_banana_images_used = nano_banana_images_used + ?, updated_at = ? WHERE job_id = ?`
+  ).run(delta, new Date().toISOString(), jobId);
 }
 
 export interface RawJobRow {
   job_id: string;
+  user_id: string | null;
   original_filename: string;
   visual_style: string;
+  conversion_mode: string;
+  target_fps: number;
+  nano_banana_images_used: number;
   input_path: string;
   audio_path: string | null;
   output_path: string | null;
@@ -146,24 +291,41 @@ interface RawSceneRow {
   duration_ms: number | null;
 }
 
+interface RawFrameRow {
+  frame_index: number;
+  timestamp_sec: number;
+  source_asset: string;
+  rendered_asset: string | null;
+  status: FrameStatus;
+  error_message: string | null;
+  duration_ms: number | null;
+}
+
 export function createJobRecord(params: {
   jobId: string;
+  userId: string;
   originalFilename: string;
   visualStyle: VisualStyleId;
+  conversionMode: ConversionMode;
+  targetFps: number;
   inputPath: string;
   metadata: VideoMetadata;
 }): void {
   const now = new Date().toISOString();
   db.prepare(
     `INSERT INTO jobs (
-      job_id, original_filename, visual_style, input_path, status, progress,
+      job_id, user_id, original_filename, visual_style, conversion_mode, target_fps,
+      nano_banana_images_used, input_path, status, progress,
       current_stage, last_completed_stage, stage_detail,
       metadata_json, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, 'queued', 5, 1, 1, 'Video validated and queued for frame extraction.', ?, ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'queued', 5, 1, 1, 'Video validated and queued for frame extraction.', ?, ?, ?)`
   ).run(
     params.jobId,
+    params.userId,
     params.originalFilename,
     params.visualStyle,
+    params.conversionMode,
+    params.targetFps,
     params.inputPath,
     JSON.stringify(params.metadata),
     now,
@@ -414,23 +576,119 @@ export function getScenesForJob(jobId: string): SceneSegment[] {
   }));
 }
 
+export function upsertFrames(jobId: string, frames: FrameItem[]): void {
+  const stmt = db.prepare(`
+    INSERT INTO job_frames (
+      job_id, frame_index, timestamp_sec, source_asset, rendered_asset, status, error_message, duration_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(job_id, frame_index) DO UPDATE SET
+      timestamp_sec = excluded.timestamp_sec,
+      source_asset = excluded.source_asset,
+      rendered_asset = COALESCE(excluded.rendered_asset, job_frames.rendered_asset)
+  `);
+
+  const tx = db.transaction((list: FrameItem[]) => {
+    for (const f of list) {
+      stmt.run(
+        jobId,
+        f.frameIndex,
+        f.timestampSec,
+        f.sourceAsset,
+        f.renderedAsset ?? null,
+        f.status,
+        f.errorMessage ?? null,
+        f.durationMs ?? null
+      );
+    }
+  });
+  tx(frames);
+}
+
+export function updateFrameState(
+  jobId: string,
+  frameIndex: number,
+  fields: Partial<{
+    status: FrameStatus;
+    renderedAsset: string | null;
+    errorMessage: string | null;
+    durationMs: number | null;
+  }>
+): void {
+  const assignments: string[] = [];
+  const values: unknown[] = [];
+
+  if (fields.status !== undefined) {
+    assignments.push('status = ?');
+    values.push(fields.status);
+  }
+  if (fields.renderedAsset !== undefined) {
+    assignments.push('rendered_asset = ?');
+    values.push(fields.renderedAsset);
+  }
+  if (fields.errorMessage !== undefined) {
+    assignments.push('error_message = ?');
+    values.push(fields.errorMessage);
+  }
+  if (fields.durationMs !== undefined) {
+    assignments.push('duration_ms = ?');
+    values.push(fields.durationMs);
+  }
+  if (assignments.length === 0) return;
+
+  values.push(jobId, frameIndex);
+  db.prepare(`UPDATE job_frames SET ${assignments.join(', ')} WHERE job_id = ? AND frame_index = ?`).run(
+    ...values
+  );
+}
+
+export function getFramesForJob(jobId: string): FrameItem[] {
+  const rows = db
+    .prepare('SELECT * FROM job_frames WHERE job_id = ? ORDER BY frame_index ASC')
+    .all(jobId) as RawFrameRow[];
+
+  return rows.map((r) => ({
+    frameIndex: r.frame_index,
+    timestampSec: r.timestamp_sec,
+    sourceAsset: r.source_asset,
+    renderedAsset: r.rendered_asset ?? undefined,
+    status: r.status,
+    errorMessage: r.error_message ?? undefined,
+    durationMs: r.duration_ms ?? undefined,
+  }));
+}
+
 function hydrateJob(row: RawJobRow): JobResponse {
+  const conversionMode = resolveConversionMode(row.conversion_mode);
   const stageDef =
     PIPELINE_STAGES.find((s) => s.id === row.current_stage) ?? PIPELINE_STAGES[0];
+  let stageLabel: string = stageDef.label;
+  if (conversionMode === 'nano_banana_frames') {
+    if (row.current_stage === 7) stageLabel = 'Nano Banana generating 3D frames';
+    if (row.current_stage === 8) stageLabel = 'Stitching 3D frame sequence';
+  } else {
+    if (row.current_stage === 7) stageLabel = 'Veo generating 3D scenes';
+    if (row.current_stage === 8) stageLabel = 'Combining generated scenes';
+  }
+
   const styleDef = resolveVisualStyle(row.visual_style);
   const characters = getCharactersForJob(row.job_id);
   const scenes = getScenesForJob(row.job_id);
+  const frames = getFramesForJob(row.job_id);
   const hasOutputVideo = Boolean(row.output_path && fs.existsSync(row.output_path));
 
   return {
     jobId: row.job_id,
+    userId: row.user_id,
     originalFilename: row.original_filename,
     visualStyle: styleDef.id,
     visualStyleLabel: styleDef.name,
+    conversionMode,
+    targetFps: Number(row.target_fps) || 2,
+    nanoBananaImagesUsed: Number(row.nano_banana_images_used) || 0,
     status: row.status,
     progress: row.progress,
     currentStage: row.current_stage,
-    currentStageLabel: stageDef.label,
+    currentStageLabel: stageLabel,
     lastCompletedStage: row.last_completed_stage,
     stageDetail: row.stage_detail,
     estimatedSecondsRemaining: row.estimated_seconds_remaining,
@@ -439,6 +697,7 @@ function hydrateJob(row: RawJobRow): JobResponse {
     metadata: JSON.parse(row.metadata_json) as VideoMetadata,
     characters,
     scenes,
+    frames,
     hasOutputVideo,
     outputMetadata: row.output_metadata_json
       ? (JSON.parse(row.output_metadata_json) as VideoMetadata)
@@ -454,10 +713,10 @@ export function getJobResponse(jobId: string): JobResponse | null {
   return hydrateJob(row);
 }
 
-export function listRecentJobs(limit = 20): JobResponse[] {
+export function listRecentJobsForUser(userId: string, limit = 25): JobResponse[] {
   const rows = db
-    .prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?')
-    .all(limit) as RawJobRow[];
+    .prepare('SELECT * FROM jobs WHERE user_id = ? OR user_id IS NULL ORDER BY created_at DESC LIMIT ?')
+    .all(userId, limit) as RawJobRow[];
   return rows.map(hydrateJob);
 }
 

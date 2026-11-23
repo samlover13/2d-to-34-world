@@ -157,6 +157,199 @@ export async function extractFrameAt(
   );
 }
 
+export async function extractSequenceFrames(params: {
+  inputPath: string;
+  assetsDir: string;
+  durationSec: number;
+  targetFps: number;
+  maxFrames: number;
+}): Promise<Array<{ frameIndex: number; timestampSec: number; sourceAsset: string }>> {
+  const { inputPath, assetsDir, durationSec, targetFps, maxFrames } = params;
+  fs.mkdirSync(assetsDir, { recursive: true });
+
+  const desiredCount = Math.max(2, Math.round(durationSec * targetFps));
+  const clampedCount = Math.min(Math.max(2, maxFrames), desiredCount);
+  const step = durationSec / clampedCount;
+
+  const extracted: Array<{ frameIndex: number; timestampSec: number; sourceAsset: string }> = [];
+  for (let i = 0; i < clampedCount; i++) {
+    const ts = Math.min(Math.max(0.05, i * step), Math.max(0.05, durationSec - 0.05));
+    const sourceAsset = `seq_${String(i).padStart(4, '0')}_src.jpg`;
+    const outPath = path.join(assetsDir, sourceAsset);
+    if (!fs.existsSync(outPath)) {
+      await extractFrameAt(inputPath, ts, outPath);
+    }
+    if (fs.existsSync(outPath)) {
+      extracted.push({
+        frameIndex: i,
+        timestampSec: Math.round(ts * 100) / 100,
+        sourceAsset,
+      });
+    }
+  }
+  return extracted;
+}
+
+export async function assembleFramesAndMuxAudio(params: {
+  frameImagePaths: string[];
+  originalAudioPath: string | null;
+  combinedSilentPath: string;
+  finalMp4Path: string;
+  targetWidth: number;
+  targetHeight: number;
+  targetDurationSec: number;
+  onStageSyncAudio?: () => void;
+  onStageRenderFinal?: () => void;
+}): Promise<VideoMetadata> {
+  const {
+    frameImagePaths,
+    originalAudioPath,
+    combinedSilentPath,
+    finalMp4Path,
+    targetWidth,
+    targetHeight,
+    targetDurationSec,
+    onStageSyncAudio,
+    onStageRenderFinal,
+  } = params;
+
+  if (frameImagePaths.length === 0) {
+    throw new Error('No Nano Banana rendered 3D frames available to assemble.');
+  }
+
+  const perFrameDur = Math.max(0.1, targetDurationSec / frameImagePaths.length);
+  const concatListPath = `${combinedSilentPath}_frames.txt`;
+  const lines: string[] = [];
+  for (const imgPath of frameImagePaths) {
+    lines.push(`file '${imgPath.replace(/'/g, "'\\''")}'`);
+    lines.push(`duration ${perFrameDur.toFixed(4)}`);
+  }
+  // FFmpeg concat demuxer requires repeating the final image entry so its duration is respected
+  const lastImg = frameImagePaths[frameImagePaths.length - 1];
+  lines.push(`file '${lastImg.replace(/'/g, "'\\''")}'`);
+  fs.writeFileSync(concatListPath, lines.join('\n'), 'utf8');
+
+  // Stage 8: Assemble Nano Banana 3D frame sequence into crisp 24fps video matching target dimensions
+  await execFileAsync(
+    'ffmpeg',
+    [
+      '-y',
+      '-f',
+      'concat',
+      '-safe',
+      '0',
+      '-i',
+      concatListPath,
+      '-vf',
+      `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=increase,crop=${targetWidth}:${targetHeight},setsar=1,fps=24,format=yuv420p`,
+      '-t',
+      targetDurationSec.toFixed(3),
+      '-c:v',
+      'libx264',
+      '-preset',
+      'medium',
+      '-crf',
+      '19',
+      '-pix_fmt',
+      'yuv420p',
+      '-an',
+      combinedSilentPath,
+    ],
+    { timeout: 300000 }
+  );
+
+  // Stage 9 & 10: Sync original audio & render final MP4
+  onStageSyncAudio?.();
+  const hasValidAudio =
+    Boolean(originalAudioPath) &&
+    fs.existsSync(originalAudioPath!) &&
+    fs.statSync(originalAudioPath!).size > 0;
+
+  onStageRenderFinal?.();
+
+  if (hasValidAudio && originalAudioPath) {
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-i',
+        combinedSilentPath,
+        '-i',
+        originalAudioPath,
+        '-map',
+        '0:v:0',
+        '-map',
+        '1:a:0',
+        '-c:v',
+        'libx264',
+        '-profile:v',
+        'high',
+        '-level',
+        '4.1',
+        '-preset',
+        'medium',
+        '-crf',
+        '19',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '192k',
+        '-ar',
+        '48000',
+        '-af',
+        `apad=whole_dur=${targetDurationSec.toFixed(2)}`,
+        '-shortest',
+        '-movflags',
+        '+faststart',
+        finalMp4Path,
+      ],
+      { timeout: 300000 }
+    );
+  } else {
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-i',
+        combinedSilentPath,
+        '-f',
+        'lavfi',
+        '-i',
+        'anullsrc=channel_layout=stereo:sample_rate=48000',
+        '-map',
+        '0:v:0',
+        '-map',
+        '1:a:0',
+        '-c:v',
+        'libx264',
+        '-profile:v',
+        'high',
+        '-level',
+        '4.1',
+        '-preset',
+        'medium',
+        '-crf',
+        '19',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-shortest',
+        '-movflags',
+        '+faststart',
+        finalMp4Path,
+      ],
+      { timeout: 300000 }
+    );
+  }
+
+  return probeVideo(finalMp4Path);
+}
+
 export async function sliceSceneVideo(
   inputPath: string,
   startSec: number,
